@@ -1,6 +1,7 @@
 # NexStar Protocol Converter
 
-ESP32 firmware for bridging telescope-control clients to an original Celestron NexStar mount while preserving the mount's single-command protocol behavior.
+ESP32 firmware for bridging telescope-control clients to an original Celestron
+NexStar mount while preserving the mount's single-command protocol behavior.
 
 ## Tested baseline
 
@@ -37,16 +38,21 @@ Upload:
 
 ```bash
 arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter
+```
 
 For a validated release build, compile the matching versioned directory, for
 example `firmware/Nexstar_Protocol_Converter_v6.99`.
 
 ## Documentation map
 
-- `docs/architecture.md` — module ownership and runtime invariants.
-- `docs/protocol.md` — mount transaction rules and recovery boundaries.
-- `docs/build_environment.md` — reproducible build and validation workflow.
-- `docs/repository_layout.md` — source, release, tooling, and local-artifact policy.
-- `docs/testing.md` — software and hardware validation expectations.
-- `docs/console_help.md` — serial/Telnet command descriptions and diagnostics.
-```
+- `docs/architecture.md` - module ownership and runtime invariants.
+- `docs/diagrams.md` - rendered architecture, runtime, protocol-flow, and recovery diagrams.
+- `docs/protocol.md` - mount transaction rules and recovery boundaries.
+- `docs/protocol_stack.md` - client request paths through the firmware.
+- `docs/client_matrix.md` - client capabilities, ports, and response behavior.
+- `docs/web_endpoints.md` - Web UI, HTTPS, and Alpaca route inventory.
+- `docs/recovery_runbook.md` - diagnostic and recovery procedure.
+- `docs/build_environment.md` - reproducible build and validation workflow.
+- `docs/repository_layout.md` - source, release, tooling, and local-artifact policy.
+- `docs/testing.md` - software and hardware validation expectations.
+- `docs/console_help.md` - serial/Telnet command descriptions and diagnostics.
