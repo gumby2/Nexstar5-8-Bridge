@@ -27,6 +27,18 @@ Example:
 rawgoto 1 wait 0
 ```
 
+## Direct GOTO and menu commands
+
+```text
+goto radec <RA hours 0..24) <Dec degrees -90..90>
+goto altaz <altitude degrees -90..90> <azimuth degrees 0..360)
+menu
+```
+
+The GOTO commands use the same safety checks and asynchronous queue as the Web
+UI. The ANSI menu identifies browser-only catalog, time, NTP, and safety-form
+actions instead of duplicating those larger interfaces in Telnet.
+
 ## Operational invariants
 
 - The mount accepts one command at a time.

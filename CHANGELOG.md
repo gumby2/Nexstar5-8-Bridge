@@ -1,5 +1,18 @@
 # Changelog
 
+## v7.03
+
+- Added Telnet RA/Dec and Alt/Az GOTO commands using the same safety checks and
+  asynchronous queue as the Web UI.
+- Aligned Telnet Control and Setup menus with the Web UI and documented
+  browser-only catalog, time, NTP, and safety actions.
+- Corrected expanded Telnet menu label bounds.
+- Regenerated the precompressed Web UI asset with on-demand BSC5 loading.
+- Prevented stale browser `statusAdvanced` preferences from hiding the basic
+  Status panel.
+- Validated compile, flash, serial boot, Web, Telnet, and listener availability
+  on classic ESP32 COM12.
+
 ## v6.99
 
 - Clarified serial and Telnet help for `rawmount` and `rawgoto`.

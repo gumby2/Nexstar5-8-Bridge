@@ -1,6 +1,6 @@
 # Functional and block diagrams
 
-These diagrams describe the current v6.99 architecture. They are logical
+These diagrams describe the modular v7.03-derived architecture. They are logical
 diagrams: module ownership is more stable than individual function names, and
 some application state still resides in the Arduino sketch during the
 modularization work.

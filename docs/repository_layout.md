@@ -26,6 +26,13 @@ Credentials and private settings must never be added to a release snapshot.
 The existing HTTPS certificate behavior is preserved; certificate changes are
 out of scope for routine cleanup.
 
+## Canonical-source decision
+
+The validated v7.03 modular source is committed under
+`firmware/Nexstar_Protocol_Converter_v7.03`. The older development sketch is
+retained as a comparison snapshot. The v7.03 snapshot reuses the existing
+repository HTTPS certificate include so private key material is not duplicated.
+
 ## Release policy
 
 1. Develop on a feature or refactor branch.

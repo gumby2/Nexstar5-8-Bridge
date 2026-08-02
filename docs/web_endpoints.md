@@ -1,8 +1,9 @@
 # Web endpoint reference
 
-This is the operator-facing route inventory for the v6.99 Web UI. The route
-registration in `firmware/Nexstar_Protocol_Converter/Nexstar_Protocol_Converter.ino`
-remains the source of truth; this document groups the routes by purpose.
+This is the operator-facing route inventory for the modular v7.03 Web UI. The
+active versioned source remains the route source of truth; this document groups
+the routes by purpose. The committed v7.03 snapshot is the current validated
+route source; automated route-table generation remains a follow-up task.
 
 ## Pages and status
 

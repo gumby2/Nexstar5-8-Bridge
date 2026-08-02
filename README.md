@@ -5,18 +5,18 @@ NexStar mount while preserving the mount's single-command protocol behavior.
 
 ## Tested baseline
 
-The latest validated ESP32 release is v6.99. It includes the asynchronous HTTP
-compatibility layer, nonblocking Telnet output handling, and bounded mount-byte
-draining after GOTO completion.
+The repository's latest integrated reference is v6.99. The latest hardware
+validation record is v7.03, built from the modular source currently held in the
+Downloads release directory; see `docs/release_v7.03.md`.
 
-The repository also retains earlier versioned release snapshots under
-`firmware/` for comparison and rollback. The v6.99 snapshot is the current
-hardware-tested reference.
+The validated v7.03 source is now committed under
+`firmware/Nexstar_Protocol_Converter_v7.03`. The older development sketch is
+retained for comparison and rollback until the next integration pass.
 
 ## Target
 
 - Board: ESP32 Dev Module
-- ESP32 Arduino core: 3.3.10
+- ESP32 Arduino core: 3.3.10 target; v7.03 hardware validation used 3.3.11
 - FQBN: `esp32:esp32:esp32:PartitionScheme=huge_app`
 - Mount UART: RX GPIO 16, TX GPIO 17
 
@@ -47,6 +47,9 @@ example `firmware/Nexstar_Protocol_Converter_v6.99`.
 
 - `docs/architecture.md` - module ownership and runtime invariants.
 - `docs/diagrams.md` - rendered architecture, runtime, protocol-flow, and recovery diagrams.
+- `docs/release_v7.03.md` - v7.03 build, flash, and validation baseline.
+- `docs/compatibility_matrix.md` - current Web, Telnet, protocol-client, and stability coverage.
+- `docs/telnet_web_parity.md` - shared actions and browser-only behavior.
 - `docs/protocol.md` - mount transaction rules and recovery boundaries.
 - `docs/protocol_stack.md` - client request paths through the firmware.
 - `docs/client_matrix.md` - client capabilities, ports, and response behavior.
