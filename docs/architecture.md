@@ -73,6 +73,9 @@ The firmware uses the Arduino single-threaded `setup()` and `loop()` model. Long
 - `setup()` initializes serial, filesystems/settings, Wi-Fi or Bluetooth mode, mount transport, web routes, Alpaca routes, TCP listeners, UDP discovery, and Telnet.
 - `loop()` services mount polling, queued GOTO work, non-blocking GOTO completion, async read/slew requests, HTTP clients, Alpaca discovery, LX200 TCP, Stellarium TCP, Bluetooth LX200, Telnet, NTP, staged Alpaca time/location updates, and console input.
 - Mount waits call `serviceNetworkDuringMountWait()` so selected network work can continue while the mount serial path waits for bytes.
+- GOTO completion handling consumes `@` and performs a bounded post-completion
+  drain before normal E/Z polling resumes, preventing trailing mount bytes from
+  becoming the next transaction's handshake input.
 - Bluetooth LX200 parsing is intentionally not serviced from mount wait loops, because accepting a new SkySafari command while a mount command is active can violate the original mount's single-command rule.
 
 ## Command ownership and invariants

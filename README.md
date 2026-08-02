@@ -2,9 +2,15 @@
 
 ESP32 firmware for bridging telescope-control clients to an original Celestron NexStar mount while preserving the mount's single-command protocol behavior.
 
-## Tested Baseline
+## Tested baseline
 
-v5.75 is the tested working refactor baseline.
+The latest validated ESP32 release is v6.98. It includes the asynchronous HTTP
+compatibility layer, nonblocking Telnet output handling, and bounded mount-byte
+draining after GOTO completion.
+
+The repository also retains earlier versioned release snapshots under
+`firmware/` for comparison and rollback. The v6.98 snapshot is the current
+hardware-tested reference.
 
 ## Target
 
@@ -21,14 +27,25 @@ Install Arduino CLI and the ESP32 core:
 arduino-cli core install esp32:esp32@3.3.10
 ```
 
-Compile:
+Compile the development sketch:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.75
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter
 ```
 
 Upload:
 
 ```bash
-arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v5.75
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter
+
+For a validated release build, compile the matching versioned directory, for
+example `firmware/Nexstar_Protocol_Converter_v6.98`.
+
+## Documentation map
+
+- `docs/architecture.md` — module ownership and runtime invariants.
+- `docs/protocol.md` — mount transaction rules and recovery boundaries.
+- `docs/build_environment.md` — reproducible build and validation workflow.
+- `docs/repository_layout.md` — source, release, tooling, and local-artifact policy.
+- `docs/testing.md` — software and hardware validation expectations.
 ```

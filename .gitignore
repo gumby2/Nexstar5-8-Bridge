@@ -10,3 +10,24 @@ arduino-cli
 *.tar.gz
 
 firmware/*/build/
+
+# Local agent/editor state and Python caches.
+.codex/
+__pycache__/
+*.py[cod]
+
+# Local historical source copies kept outside the repository release tree.
+/Nexstar_Protocol_Converter_v5.74/
+/Nexstar_Protocol_Converter_v5.75/
+/Nexstar_Protocol_Converter_v5.74.zip
+/Nexstar_Protocol_Converter_v5.75.zip
+
+# Local CAD working files (the authoritative wiring documentation remains in hardware/).
+/cad_rebuild_tools.fs
+/measurements.md
+/onshape-import-box.png
+/onshape-import-cover.png
+/onshape-import-lid.png
+/onshape-parametric-box-baseline.png
+/onshape-parametric-cover-baseline.png
+/onshape-parametric-lid-baseline.png
