@@ -4,12 +4,12 @@ ESP32 firmware for bridging telescope-control clients to an original Celestron N
 
 ## Tested baseline
 
-The latest validated ESP32 release is v6.98. It includes the asynchronous HTTP
+The latest validated ESP32 release is v6.99. It includes the asynchronous HTTP
 compatibility layer, nonblocking Telnet output handling, and bounded mount-byte
 draining after GOTO completion.
 
 The repository also retains earlier versioned release snapshots under
-`firmware/` for comparison and rollback. The v6.98 snapshot is the current
+`firmware/` for comparison and rollback. The v6.99 snapshot is the current
 hardware-tested reference.
 
 ## Target
@@ -39,7 +39,7 @@ Upload:
 arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter
 
 For a validated release build, compile the matching versioned directory, for
-example `firmware/Nexstar_Protocol_Converter_v6.98`.
+example `firmware/Nexstar_Protocol_Converter_v6.99`.
 
 ## Documentation map
 
@@ -48,4 +48,5 @@ example `firmware/Nexstar_Protocol_Converter_v6.98`.
 - `docs/build_environment.md` — reproducible build and validation workflow.
 - `docs/repository_layout.md` — source, release, tooling, and local-artifact policy.
 - `docs/testing.md` — software and hardware validation expectations.
+- `docs/console_help.md` — serial/Telnet command descriptions and diagnostics.
 ```

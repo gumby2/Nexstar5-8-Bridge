@@ -1,5 +1,11 @@
 # Changelog
 
+## v6.99
+
+- Clarified serial and Telnet help for `rawmount` and `rawgoto`.
+- Documented the difference between completion-consuming `wait` diagnostics and
+  low-level `nowait` diagnostics.
+
 ## v6.98
 
 - Added bounded post-completion mount-byte draining for blocking and asynchronous
