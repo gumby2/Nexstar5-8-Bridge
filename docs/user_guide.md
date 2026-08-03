@@ -58,6 +58,12 @@ The RJ22 cable plugs into the small RS-232 jack on the bottom of the NexStar
 hand controller—not the HAND CONTROL or AUX socket. The full wiring table and
 references are in [`hardware/wiring.md`](../hardware/wiring.md).
 
+Hardware references:
+
+- [Celestron NexStar 5 manual](https://www.celestrondownloads.com/repository/_Manuals%20by%20Product%20Number/11031_nexstar_5_manual.pdf)
+- [CP2102 6-in-1 converter manual](https://manuals.plus/asin/B0F37QWLYH.pdf)
+- [Arduino-ESP32 serial/UART documentation](https://docs.espressif.com/projects/arduino-esp32/en/latest/api/serial.html)
+
 </details>
 
 <details>
