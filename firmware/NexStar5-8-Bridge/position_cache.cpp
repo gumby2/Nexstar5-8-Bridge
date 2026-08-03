@@ -1,6 +1,7 @@
 #include "position_cache.h"
 
 #include "logging.h"
+#include "bluetooth_services.h"
 #include "mount_transport.h"
 #include "nexstar_protocol.h"
 #include "observer_time.h"
@@ -258,6 +259,16 @@ void serviceMountPolling() {
   if (mountRecoveryUntilMs && (long)(nowMs - mountRecoveryUntilMs) < 0) {
     if (nextMountPollDueMs == 0 || (long)(nextMountPollDueMs - mountRecoveryUntilMs) < 0) {
       nextMountPollDueMs = mountRecoveryUntilMs;
+    }
+    return;
+  }
+
+  // Bluetooth SkySafari and Telnet share the single Arduino loop. Defer a
+  // background E poll briefly after BT traffic so a mount handshake cannot
+  // make the Telnet client wait behind the SkySafari transaction.
+  if (bluetoothMountPollQuietWindowActive()) {
+    if (nextMountPollDueMs == 0 || (long)(nowMs - nextMountPollDueMs) >= 0) {
+      nextMountPollDueMs = nowMs + activePollMs;
     }
     return;
   }

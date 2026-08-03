@@ -72,6 +72,14 @@ bool bluetoothLX200ClientConnected() {
   return lx200BtClientConnected;
 }
 
+bool bluetoothMountPollQuietWindowActive() {
+  if (!lx200BtClientConnected) return false;
+  unsigned long nowMs = millis();
+  if (btClientConnectedAtMs && nowMs - btClientConnectedAtMs < 1500UL) return true;
+  if (!lx200BtLastCommandHandledMs) return false;
+  return nowMs - lx200BtLastCommandHandledMs < 1500UL;
+}
+
 const char* bluetoothBaseName() {
   return BT_NAME;
 }

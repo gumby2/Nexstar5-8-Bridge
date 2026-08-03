@@ -17,6 +17,7 @@ bool bluetoothRuntimeIsEnabled();
 void setBluetoothRuntimeEnabled(bool enabled);
 bool bluetoothClientConnected();
 bool bluetoothLX200ClientConnected();
+bool bluetoothMountPollQuietWindowActive();
 
 String runtimeBtName();
 const char* bluetoothBaseName();
