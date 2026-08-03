@@ -280,6 +280,7 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
 extern const char* FW_NAME;
 extern const char* FW_VERSION;
+extern const char* PROJECT_REPO_URL;
 extern uint32_t alpacaHttpRequests;
 const uint16_t HTTP_WEB_PORT = 80;
 const uint16_t ALPACA_DISCOVERY_PORT = 32227;
@@ -1749,7 +1750,7 @@ static void drawTitleActionRow(Print &out) {
   vtCursor(out,2,1); out.print(gV());
   char title[96];
   const char *modeText = bridgeMode == BRIDGE_MODE_WIFI_FULL ? "BT" : "WiFi";
-  snprintf(title, sizeof(title), " NexStar Protocol Converter %s", FW_VERSION);
+  snprintf(title, sizeof(title), " %s %s", FW_NAME, FW_VERSION);
 
   const int inner = (int)w - 2;
   const char rebootText[] = "[ Reboot ]";
@@ -2640,6 +2641,8 @@ void serviceTelnetConsole() {
       { const uint8_t nego[] = {255,251,1,255,251,3,255,253,3,255,253,31,255,254,34}; socketOut.write(nego,sizeof(nego)); }
       telnetApplyTextColor(telnetOut);
       telnetOut.println();
+      telnetOut.printf("%s %s\r\n", FW_NAME, FW_VERSION);
+      telnetOut.printf("Repository: %s\r\n", PROJECT_REPO_URL);
       if (telnetAuthenticated) {
         telnetOut.println("Type help.");
         telnetOut.print("> ");
