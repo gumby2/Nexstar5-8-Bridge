@@ -52,7 +52,7 @@ The build script uses:
 esp32:esp32:esp32:PartitionScheme=huge_app
 ```
 
-Generated build directories must not be created inside the source sketch. Do not create or commit `firmware/Nexstar_Protocol_Converter/build`.
+Generated build directories must not be created inside the source sketch. Do not create or commit `firmware/NexStar5-8-Bridge/build`.
 
 Environment overrides:
 
@@ -86,10 +86,10 @@ Do not include generated build output, cache directories, binaries, private cred
 
 ## Stable Releases
 
-Stable releases are merged to `main` only after validation on the development branch. Versioned release filenames use:
+Stable releases are merged to `main` only after validation on the development branch. The canonical release sketch is:
 
 ```text
-Nexstar_Protocol_Converter_vX.YY.ino
+NexStar5-8-Bridge.ino
 ```
 
 The canonical repository sketch is:
@@ -98,6 +98,5 @@ The canonical repository sketch is:
 firmware/NexStar5-8-Bridge/NexStar5-8-Bridge.ino
 ```
 
-The older unversioned sketch is retained for comparison only. Do not edit a
-published versioned snapshot in place; create a new versioned directory for a
-validated release candidate.
+The repository contains one canonical release source. Keep changes on a
+feature branch, validate them, and merge the resulting release to `main`.

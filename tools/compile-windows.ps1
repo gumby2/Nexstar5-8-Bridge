@@ -9,4 +9,4 @@ arduino-cli compile `
   --output-dir $OutDir `
   --jobs 2 `
   --warnings default `
-  (Join-Path $Root "firmware\Nexstar_Protocol_Converter")
+  (Join-Path $Root "firmware\NexStar5-8-Bridge")

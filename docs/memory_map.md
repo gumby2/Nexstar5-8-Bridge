@@ -29,4 +29,4 @@ LittleFS is used by non-ESP32 persistence paths and may also be mounted by firmw
 
 Host build output includes `.bin`, `.elf`, `.map`, and related files emitted by Arduino CLI. These belong in the configured `OUTPUT_DIR`, normally `dist/`, and the build cache belongs in `BUILD_PATH`, normally a Linux-local directory such as `$HOME/nexstar-build/nexstar-protocol-converter`.
 
-Do not place generated build output under `firmware/Nexstar_Protocol_Converter/build`.
+Do not place generated build output under `firmware/NexStar5-8-Bridge/build`.

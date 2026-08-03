@@ -33,7 +33,7 @@ OUTPUT_DIR="$PWD/dist" ./scripts/build.sh
 JOBS=2 ./scripts/build.sh
 ```
 
-Keep build output and cache outside the firmware source directory. Use a Linux-local `BUILD_PATH` for speed. Release-style generated artifacts go in `dist/`. Do not create or rely on `firmware/Nexstar_Protocol_Converter/build`.
+Keep build output and cache outside the firmware source directory. Use a Linux-local `BUILD_PATH` for speed. Release-style generated artifacts go in `dist/`. Do not create or rely on `firmware/NexStar5-8-Bridge/build`.
 
 ## CI
 

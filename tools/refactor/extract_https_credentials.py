@@ -2,8 +2,8 @@
 from pathlib import Path
 
 sketch = Path(
-    "firmware/Nexstar_Protocol_Converter/"
-    "Nexstar_Protocol_Converter.ino"
+    "firmware/NexStar5-8-Bridge/"
+    "NexStar5-8-Bridge.ino"
 )
 header = sketch.with_name("https_credentials.h")
 

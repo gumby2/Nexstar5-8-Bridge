@@ -4,7 +4,7 @@ This firmware is in the middle of a modularization pass. The Arduino sketch stil
 
 ## Current module ownership
 
-`Nexstar_Protocol_Converter.ino`
+`NexStar5-8-Bridge.ino`
 
 - Owns `setup()` and `loop()`.
 - Owns Wi-Fi, Bluetooth, Telnet, HTTP web UI, Alpaca, Stellarium, and TCP server wiring.

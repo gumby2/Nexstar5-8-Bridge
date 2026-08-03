@@ -1,4 +1,4 @@
-# NexStar Protocol Converter
+# NexStar5/8-Bridge
 
 ESP32 firmware for bridging telescope-control clients to an original Celestron
 NexStar mount while preserving the mount's single-command protocol behavior.
@@ -6,10 +6,9 @@ NexStar mount while preserving the mount's single-command protocol behavior.
 ## Tested baseline
 
 This v1.0.0 repository release contains the validated NexStar5/8-Bridge
-firmware. Its canonical source is `firmware/NexStar5-8-Bridge`; see
-[`docs/release_v1.0.0.md`](docs/release_v1.0.0.md) for the hardware validation
-record. The older
-unversioned sketch is retained for comparison only.
+firmware. Its single canonical source is
+`firmware/NexStar5-8-Bridge`; see [`docs/release_v1.0.0.md`](docs/release_v1.0.0.md)
+for the hardware validation record.
 
 ## Target
 
@@ -26,20 +25,23 @@ Install Arduino CLI and the ESP32 core:
 arduino-cli core install esp32:esp32@3.3.10
 ```
 
-Compile the validated source:
+Compile the validated source. Build output is kept outside the firmware source
+tree:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/NexStar5-8-Bridge
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --build-path .build/esp32 --output-dir dist --jobs 2 firmware/NexStar5-8-Bridge
 ```
 
-Upload:
+Upload the compiled image from `dist/`:
 
 ```bash
-arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/NexStar5-8-Bridge
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --input-dir dist --verify
 ```
 
-For repeatable builds, compile the versioned directory matching the release
-being tested. Do not overwrite a published release snapshot in place.
+The HTTPS setup server requires local certificate and private-key material.
+Before compiling a fresh clone, create the ignored file
+`firmware/https_credentials.h` as described in
+[`docs/build_guide.md`](docs/build_guide.md). Never commit that file.
 
 ## Documentation map
 

@@ -1,14 +1,11 @@
 # Repository layout
 
-The repository separates development source, immutable release snapshots,
-documentation, tooling, and generated output.
+The repository contains one canonical release source, documentation, tooling,
+and generated output.
 
 ## Tracked areas
 
-- `firmware/Nexstar_Protocol_Converter/` — older comparison sketch; it is not
-  the canonical release source.
-- `firmware/Nexstar_Protocol_Converter_vX.YY/` — versioned release snapshots.
-  Do not edit an already-published snapshot in place.
+- `firmware/NexStar5-8-Bridge/` — canonical v1.0.0 release source.
 - `docs/` — architecture, protocol, build, testing, and maintenance guidance.
 - `tools/` — source-generation and static-analysis utilities.
 - `scripts/` — reproducible test, build, and verification entry points.
@@ -19,24 +16,23 @@ documentation, tooling, and generated output.
 ## Local-only material
 
 Local agent state, Python caches, historical working copies, CAD exports, and
-build artifacts are ignored. They may remain on a developer workstation, but
-they are not part of the firmware source of record.
+build artifacts are ignored. They are not part of the firmware source of record.
 
-Credentials and private settings must never be added to a release snapshot.
+Credentials and private settings must never be added to the release source.
 The existing HTTPS certificate behavior is preserved; certificate changes are
 out of scope for routine cleanup.
 
-## Canonical-source decision
+## Canonical source
 
 The validated release source is committed under
-`firmware/NexStar5-8-Bridge` and is the source used by the
-standard build and browser checks. HTTPS certificate and private key material
-are supplied locally and are not committed to the public repository.
+`firmware/NexStar5-8-Bridge` and is used by the standard build and browser
+checks. HTTPS certificate and private key material are supplied locally and
+are not committed to the public repository.
 
 ## Release policy
 
 1. Develop on a feature or refactor branch.
-2. Compile and test the development sketch and the candidate release snapshot.
+2. Compile and test the candidate source.
 3. Record hardware validation results in the release notes or changelog.
-4. Commit the complete release snapshot with its matching versioned sketch name.
+4. Commit the complete release source and matching release documentation.
 5. Merge stable releases to `main` only after review and validation.

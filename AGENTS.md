@@ -23,7 +23,7 @@ Mandatory project rules for Codex and other automated agents working in this rep
   `$HOME/nexstar-portable-dev/arduino-cli`
 - Allow `ARDUINO_CLI` to override the CLI path.
 - Use a Linux-local build directory for speed.
-- Do not create `firmware/Nexstar_Protocol_Converter/build`.
+- Do not create `firmware/NexStar5-8-Bridge/build`.
 
 ## Required Validation Before Commit
 
