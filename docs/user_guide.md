@@ -9,6 +9,56 @@ task you need. Technical details are linked from the relevant section.
 <details open>
 <summary id="quick-start"><strong>Quick start: get connected</strong></summary>
 
+### Build and flash from a fresh checkout
+
+Install Git and Arduino CLI, then clone the public repository:
+
+```sh
+git clone https://github.com/gumby2/Nexstar5-8-Bridge.git
+cd Nexstar5-8-Bridge
+```
+
+If Arduino CLI is not already installed, download it from the [official Arduino
+CLI installation page](https://arduino.github.io/arduino-cli/latest/installation/)
+and put the executable in your `PATH`. Initialize the CLI and install the
+exact board core and library versions used by this release:
+
+```sh
+arduino-cli config init
+arduino-cli core update-index
+arduino-cli core install esp32:esp32@3.3.10
+arduino-cli lib install PsychicHttp@3.1.2 ArduinoJson@7.4.3
+```
+
+The board is **ESP32 Dev Module** with partition scheme **Huge APP (3MB No
+OTA/1MB SPIFFS)**. The firmware uses these libraries:
+
+- **PsychicHttp 3.1.2** for the asynchronous web server.
+- **ArduinoJson 7.4.3**, a dependency used by PsychicHttp.
+
+No other contributed Arduino libraries are required. The remaining libraries
+(`WiFi`, `BluetoothSerial`, `Preferences`, `LittleFS`, and related ESP32
+components) come from the ESP32 board core.
+
+The HTTPS setup server also requires the private local file
+`firmware/https_credentials.h`. Obtain this file from your secure local backup
+or deployment source; it is intentionally ignored and must never be committed.
+The tracked wrapper at
+`firmware/NexStar5-8-Bridge/https_credentials.h` includes that local file.
+
+Compile and upload from the repository root:
+
+```sh
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --build-path .build/esp32 --output-dir dist --jobs 2 firmware/NexStar5-8-Bridge
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --input-dir dist --verify
+```
+
+On Windows, `<PORT>` is usually something like `COM12`. The same workflow is
+also available through [`tools/compile-windows.ps1`](../tools/compile-windows.ps1)
+and [`scripts/build.sh`](../scripts/build.sh).
+
+### Connect and operate
+
 1. Wire the ESP32, CP2102 6-in-1 converter, and NexStar RS-232 cable as shown
    in [`hardware/wiring.md`](../hardware/wiring.md).
 2. Power the mount and hand controller.
