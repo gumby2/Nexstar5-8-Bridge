@@ -2,14 +2,14 @@
 
 The supported target is a classic ESP32 Dev Module using the Huge APP
 partition scheme. The repository release is v1.0.0; the firmware identifies as
-v7.03.
+NexStar5/8-Bridge v1.0.0.
 
 ## Arduino IDE
 
 1. Install Arduino IDE and the ESP32 board package.
 2. Select `ESP32 Dev Module`.
 3. Select partition scheme `Huge APP (3MB No OTA/1MB SPIFFS)`.
-4. Open `firmware/Nexstar_Protocol_Converter_v7.03/`.
+4. Open `firmware/NexStar5-8-Bridge/`.
 5. Select the matching `.ino` file, choose the board's COM port, compile, and
    upload.
 

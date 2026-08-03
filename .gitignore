@@ -9,6 +9,9 @@ dist/
 arduino-cli
 *.tar.gz
 
+# Local HTTPS certificate and private key material.
+/firmware/https_credentials.h
+
 firmware/*/build/
 
 # Local agent/editor state and Python caches.

@@ -95,7 +95,7 @@ Nexstar_Protocol_Converter_vX.YY.ino
 The canonical repository sketch is:
 
 ```text
-firmware/Nexstar_Protocol_Converter_v7.03/Nexstar_Protocol_Converter_v7.03.ino
+firmware/NexStar5-8-Bridge/NexStar5-8-Bridge.ino
 ```
 
 The older unversioned sketch is retained for comparison only. Do not edit a

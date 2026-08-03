@@ -2,15 +2,15 @@
 
 ## Source and hardware
 
-- Committed source: `firmware/Nexstar_Protocol_Converter_v7.03`
+- Committed source: `firmware/NexStar5-8-Bridge`
 - Target: classic ESP32 Dev Module, Huge APP partition
 - Arduino ESP32 core used for validation: 3.3.11
 - Test port: COM12
 - Network address during validation: `192.168.0.104`
 
 This repository release packages the validated firmware baseline formerly
-tracked as v7.03. The firmware identifies itself as **NexStar5/8-Bridge
-v1.0.0**. The snapshot reuses the existing HTTPS certificate include rather
+tracked before the clean release. The firmware identifies itself as
+**NexStar5/8-Bridge v1.0.0**. The snapshot reuses the existing HTTPS certificate include rather
 than duplicating private key material.
 
 ## Included firmware baseline

@@ -66,7 +66,7 @@ git diff --stat
 Generated build folder inside firmware source:
 
 ```sh
-git status --short --ignored firmware/Nexstar_Protocol_Converter_v7.03/build
+git status --short --ignored firmware/NexStar5-8-Bridge/build
 ```
 
 Failed compile log capture:

@@ -5,8 +5,8 @@ NexStar mount while preserving the mount's single-command protocol behavior.
 
 ## Tested baseline
 
-This v1.0.0 repository release is based on the validated v7.03 firmware. Its
-canonical source is `firmware/Nexstar_Protocol_Converter_v7.03`; see
+This v1.0.0 repository release contains the validated NexStar5/8-Bridge
+firmware. Its canonical source is `firmware/NexStar5-8-Bridge`; see
 [`docs/release_v1.0.0.md`](docs/release_v1.0.0.md) for the hardware validation
 record. The older
 unversioned sketch is retained for comparison only.
@@ -14,7 +14,7 @@ unversioned sketch is retained for comparison only.
 ## Target
 
 - Board: ESP32 Dev Module
-- ESP32 Arduino core: 3.3.10 target; v7.03 hardware validation used 3.3.11
+- ESP32 Arduino core: 3.3.10 target; release validation used 3.3.11
 - FQBN: `esp32:esp32:esp32:PartitionScheme=huge_app`
 - Mount UART: RX GPIO 16, TX GPIO 17
 
@@ -29,13 +29,13 @@ arduino-cli core install esp32:esp32@3.3.10
 Compile the validated source:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v7.03
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/NexStar5-8-Bridge
 ```
 
 Upload:
 
 ```bash
-arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v7.03
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/NexStar5-8-Bridge
 ```
 
 For repeatable builds, compile the versioned directory matching the release

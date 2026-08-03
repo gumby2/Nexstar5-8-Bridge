@@ -10,10 +10,10 @@
 - HTTPS credentials extracted.
 - Logging subsystem extracted.
 
-## Current baseline: repository v1.0.0 / firmware v7.03
+## Current baseline: NexStar5/8-Bridge v1.0.0
 
-- Preserve the validated v7.03 behavior.
-- Keep the v7.03 source as the canonical build source until a later release is
+- Preserve the validated v1.0.0 behavior.
+- Keep the v1.0.0 source as the canonical build source until a later release is
   validated.
 - Expand repeatable client and mount-fault testing without changing firmware
   behavior.

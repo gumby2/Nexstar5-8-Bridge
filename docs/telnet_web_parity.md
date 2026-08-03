@@ -47,5 +47,5 @@ pretending that they are available through a hidden or incomplete text form.
 
 Older UI builds stored `statusAdvanced=1` in browser local storage. If a newer
 build does not include an advanced-status container, that preference must not
-hide the basic Status panel. v7.03 forces the available basic panel visible in
+hide the basic Status panel. v1.0.0 forces the available basic panel visible in
 that case.

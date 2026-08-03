@@ -1,8 +1,8 @@
 # Web endpoint reference
 
-This is the operator-facing route inventory for the modular v7.03 Web UI. The
+This is the operator-facing route inventory for the NexStar5/8-Bridge v1.0.0 Web UI. The
 active versioned source remains the route source of truth; this document groups
-the routes by purpose. The committed v7.03 snapshot is the current validated
+the routes by purpose. The committed v1.0.0 release is the current validated
 route source; automated route-table generation remains a follow-up task.
 
 ## Pages and status
