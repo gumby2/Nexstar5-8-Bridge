@@ -8,9 +8,10 @@
 - Test port: COM12
 - Network address during validation: `192.168.0.104`
 
-This repository release packages the validated v7.03 firmware. The snapshot
-reuses the existing HTTPS certificate include rather than duplicating private
-key material. The firmware continues to identify itself as v7.03.
+This repository release packages the validated firmware baseline formerly
+tracked as v7.03. The firmware identifies itself as **NexStar5/8-Bridge
+v1.0.0**. The snapshot reuses the existing HTTPS certificate include rather
+than duplicating private key material.
 
 ## Included firmware baseline
 
@@ -20,17 +21,17 @@ key material. The firmware continues to identify itself as v7.03.
   clearly identify browser-only functions.
 - Telnet menu label bounds were corrected for the expanded Control and Setup
   menus.
-- The precompressed Web UI asset reports v7.03 and preserves on-demand BSC5
-  loading.
+- The precompressed Web UI asset reports NexStar5/8-Bridge v1.0.0, links to the
+  public repository, and preserves on-demand BSC5 loading.
 - A stale `statusAdvanced` browser preference can no longer hide the only
   available Status panel.
 
 ## Validation evidence
 
-- Compile succeeded: 2,565,539 bytes of program storage, 80,848 bytes of
+- Compile succeeded: 2,565,951 bytes of program storage, 80,864 bytes of
   globals.
 - Flash upload to COM12 completed with verified flash hashes.
-- Serial boot reported v7.03 with no crashdump, panic, brownout, or reset
+- Serial boot reported NexStar5/8-Bridge v1.0.0 with no crashdump, panic, brownout, or reset
   marker.
 - TCP listeners accepted connections on ports 23, 80, 4030, 10001, and 11111.
 - Web `/status` returned HTTP 200 JSON.

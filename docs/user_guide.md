@@ -1,7 +1,7 @@
 # NexStar 5/8 Bridge user guide
 
 Repository release: **v1.0.0**  
-Included firmware identity: **v7.03**
+Included firmware identity: **NexStar5/8-Bridge v1.0.0**
 
 This is an operator guide for setting up and using the bridge. Open only the
 task you need. Technical details are linked from the relevant section.
@@ -11,16 +11,44 @@ task you need. Technical details are linked from the relevant section.
 
 1. Wire the ESP32, CP2102 6-in-1 converter, and NexStar RS-232 cable as shown
    in [`hardware/wiring.md`](../hardware/wiring.md).
-2. Power the ESP32 and mount.
-3. Find the bridge's IP address from the serial console, router, or access-point
+2. Power the mount and hand controller.
+3. Complete a successful mount alignment using the hand controller.
+4. Start the hand controller's **RS-232 mode**. The bridge cannot begin mount
+   communications until the handset has entered this mode.
+5. Power the ESP32 and connect it to the mount's RS-232 cable.
+6. Find the bridge's IP address from the serial console, router, or access-point
    setup.
-4. Open `http://<device-ip>/` in a browser.
-5. In **Setup**, confirm Wi-Fi, site/time, mount polling, and service ports.
-6. Open **Status** and confirm that the mount, position, time, and network
+7. Open `http://<device-ip>/` in a browser.
+8. In **Setup**, confirm Wi-Fi, site/time, mount polling, and service ports.
+9. Open **Status** and confirm that the mount, position, time, and network
    services are populated.
 
 If the Web UI does not open, start with the [troubleshooting section](#troubleshooting),
 then use the [recovery runbook](recovery_runbook.md).
+
+</details>
+
+<details>
+<summary><strong>Operating modes: Wi-Fi, Web/Telnet, and Bluetooth</strong></summary>
+
+Select a mode from **Setup** or use the serial/Telnet command shown below. A
+mode change is saved and takes effect after reboot.
+
+| Mode | Command | Services available |
+| --- | --- | --- |
+| Full Wi-Fi | `mode wifi` | Full Web UI, Telnet, SkySafari Wi-Fi/LX200, Alpaca, and Stellarium. |
+| Wi-Fi servers / no Web UI | `mode wifi noweb` | Wi-Fi protocol servers and Telnet; full Web UI is disabled. |
+| Web UI only | `mode web` | Web UI and Telnet; SkySafari Wi-Fi/LX200, Alpaca, and Stellarium are disabled. |
+| Bluetooth/Telnet | `mode bt` | Bluetooth SkySafari plus the Telnet setup path; the full Web UI and other Wi-Fi protocol services are not available. |
+
+Bluetooth mode is intended for SkySafari over Bluetooth when Wi-Fi service
+load or radio coexistence is undesirable. The Bluetooth device name is shown
+in **Status** and in the setup page. Use Full Wi-Fi mode when browser control,
+Alpaca, Stellarium, or the complete Wi-Fi LX200 service is required.
+
+Regardless of bridge mode, the mount must already be aligned successfully and
+the handset's RS-232 mode must be started before expecting position reads or
+GOTO commands to work.
 
 </details>
 
