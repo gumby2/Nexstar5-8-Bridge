@@ -10,13 +10,12 @@
 - HTTPS credentials extracted.
 - Logging subsystem extracted.
 
-## Current v5.x
+## Current baseline: v7.03
 
-- Complete modularization.
-- Preserve behavior.
-- Improve CI.
-- Improve browser regression tests.
-- Create reproducible release process.
+- Preserve the validated v7.03 behavior.
+- Keep v7.03 as the canonical build source until a later release is validated.
+- Expand repeatable client and mount-fault testing without changing firmware
+  behavior.
 
 ## Next
 

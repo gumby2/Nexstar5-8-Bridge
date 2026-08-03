@@ -92,8 +92,12 @@ Stable releases are merged to `main` only after validation on the development br
 Nexstar_Protocol_Converter_vX.YY.ino
 ```
 
-The repository working sketch remains:
+The canonical repository sketch is:
 
 ```text
-firmware/Nexstar_Protocol_Converter/Nexstar_Protocol_Converter.ino
+firmware/Nexstar_Protocol_Converter_v7.03/Nexstar_Protocol_Converter_v7.03.ino
 ```
+
+The older unversioned sketch is retained for comparison only. Do not edit a
+published versioned snapshot in place; create a new versioned directory for a
+validated release candidate.

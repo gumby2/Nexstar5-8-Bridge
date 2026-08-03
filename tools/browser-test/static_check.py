@@ -1,7 +1,7 @@
 from pathlib import Path
 import sys
 
-p = Path(__file__).resolve().parents[2] / "firmware/Nexstar_Protocol_Converter/Nexstar_Protocol_Converter.ino"
+p = Path(__file__).resolve().parents[2] / "firmware/Nexstar_Protocol_Converter_v7.03/Nexstar_Protocol_Converter_v7.03.ino"
 s = p.read_text(encoding="utf-8")
 required = ["refreshProtocolDash", "updateNow", "catPopulate", "gotoRaDec", "gotoAltAz", "csHost"]
 missing = [x for x in required if x not in s]

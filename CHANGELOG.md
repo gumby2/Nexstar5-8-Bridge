@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.0.0
+
+- Initial clean repository release based on the validated v7.03 firmware.
+
 ## v7.03
 
 - Added Telnet RA/Dec and Alt/Az GOTO commands using the same safety checks and

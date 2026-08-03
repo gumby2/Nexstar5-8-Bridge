@@ -5,8 +5,8 @@ documentation, tooling, and generated output.
 
 ## Tracked areas
 
-- `firmware/Nexstar_Protocol_Converter/` — development sketch used by the
-  standard build script.
+- `firmware/Nexstar_Protocol_Converter/` — older comparison sketch; it is not
+  the canonical release source.
 - `firmware/Nexstar_Protocol_Converter_vX.YY/` — versioned release snapshots.
   Do not edit an already-published snapshot in place.
 - `docs/` — architecture, protocol, build, testing, and maintenance guidance.
@@ -29,8 +29,9 @@ out of scope for routine cleanup.
 ## Canonical-source decision
 
 The validated v7.03 modular source is committed under
-`firmware/Nexstar_Protocol_Converter_v7.03`. The older development sketch is
-retained as a comparison snapshot. The v7.03 snapshot reuses the existing
+`firmware/Nexstar_Protocol_Converter_v7.03` and is the source used by the
+standard build and browser checks. The older development sketch is retained
+as a comparison snapshot. The v7.03 snapshot reuses the existing
 repository HTTPS certificate include so private key material is not duplicated.
 
 ## Release policy

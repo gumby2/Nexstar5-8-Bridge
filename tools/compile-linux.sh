@@ -10,4 +10,4 @@ arduino-cli compile \
   --output-dir "$OUT_DIR" \
   --jobs "${JOBS:-2}" \
   --warnings default \
-  "$ROOT/firmware/Nexstar_Protocol_Converter"
+  "$ROOT/firmware/Nexstar_Protocol_Converter_v7.03"

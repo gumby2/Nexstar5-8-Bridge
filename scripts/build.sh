@@ -8,7 +8,7 @@ ARDUINO_CLI="${ARDUINO_CLI:-$HOME/nexstar-portable-dev/arduino-cli}"
 BUILD_PATH="${BUILD_PATH:-$HOME/nexstar-build/nexstar-protocol-converter}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT/dist}"
 JOBS="${JOBS:-2}"
-SKETCH_DIR="$ROOT/firmware/Nexstar_Protocol_Converter"
+SKETCH_DIR="$ROOT/firmware/Nexstar_Protocol_Converter_v7.03"
 FQBN="esp32:esp32:esp32:PartitionScheme=huge_app"
 
 if [ ! -x "$ARDUINO_CLI" ]; then

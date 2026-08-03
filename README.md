@@ -5,13 +5,10 @@ NexStar mount while preserving the mount's single-command protocol behavior.
 
 ## Tested baseline
 
-The repository's latest integrated reference is v6.99. The latest hardware
-validation record is v7.03, built from the modular source currently held in the
-Downloads release directory; see `docs/release_v7.03.md`.
-
-The validated v7.03 source is now committed under
-`firmware/Nexstar_Protocol_Converter_v7.03`. The older development sketch is
-retained for comparison and rollback until the next integration pass.
+This v1.0.0 repository release is based on the validated v7.03 firmware. Its
+canonical source is `firmware/Nexstar_Protocol_Converter_v7.03`; see
+`docs/release_v7.03.md` for the hardware validation record. The older
+unversioned sketch is retained for comparison only.
 
 ## Target
 
@@ -28,20 +25,20 @@ Install Arduino CLI and the ESP32 core:
 arduino-cli core install esp32:esp32@3.3.10
 ```
 
-Compile the development sketch:
+Compile the validated source:
 
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter
+arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v7.03
 ```
 
 Upload:
 
 ```bash
-arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app firmware/Nexstar_Protocol_Converter_v7.03
 ```
 
-For a validated release build, compile the matching versioned directory, for
-example `firmware/Nexstar_Protocol_Converter_v6.99`.
+For repeatable builds, compile the versioned directory matching the release
+being tested. Do not overwrite a published release snapshot in place.
 
 ## Documentation map
 
