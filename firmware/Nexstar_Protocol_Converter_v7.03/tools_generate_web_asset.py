@@ -29,7 +29,7 @@ def extract_page() -> bytes:
                 raise RuntimeError(f"Unable to parse UI chunk: {line[:100]}")
             chunks.append(decode_cpp_string(match.group(1)))
         elif "server.sendContent(FW_NAME);" in line:
-            chunks.append("NexStar Protocol Converter")
+            chunks.append(re.search(r'FW_NAME\s*=\s*"([^"]+)"', source).group(1))
         elif "server.sendContent(FW_VERSION);" in line:
             chunks.append(re.search(r'FW_VERSION\s*=\s*"([^"]+)"', source).group(1))
         elif "server.sendContent(htmlEscape(staPass));" in line:
