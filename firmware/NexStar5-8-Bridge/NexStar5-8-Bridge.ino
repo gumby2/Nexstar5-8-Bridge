@@ -4049,6 +4049,14 @@ delay(500);
   Serial.println("[BOOT] network/mode setup begin");
   loadBridgeMode();
   loadFirmwareLoggingEnabled();
+  if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
+    // Bluetooth/Telnet mode has no Web log surface. Keep only warnings/errors
+    // and stop collecting profiler counters to protect heap and loop time.
+    LOG_LEVEL = LOG_WARN;
+    profilerEnabled = false;
+    profilerReset();
+    Serial.println("[BT_MIN] verbose logging and profiler disabled for heap margin");
+  }
   applyGpioStartupModeOverride();
   Serial.printf("[BOOT] bridge mode: %s source=%s pin=%d\n", bridgeModeName(), startupModeSource.c_str(), startupModePinUsed);
   if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
@@ -4270,8 +4278,9 @@ void loop() {
 
   { CRASHDUMP_SCOPE("console"); PROFILE_SCOPE(PROFILE_CONSOLE); handleConsole(); crashdumpMarkService("console"); }
   { CRASHDUMP_SCOPE("mount poll console"); serviceMountPolling(); crashdumpMarkService("mount poll console"); }
-  if (!bridgeModeHasWebUi()) { CRASHDUMP_SCOPE("http no-web"); diagnosticServiceBegin("http-no-web"); serviceHttpServers(); diagnosticServiceEnd(); crashdumpMarkService("http no-web"); }
-  { CRASHDUMP_SCOPE("mount poll http1"); serviceMountPolling(); crashdumpMarkService("mount poll http1"); }
+  if (bridgeMode != BRIDGE_MODE_BT_MIN_WEB) {
+    { CRASHDUMP_SCOPE("mount poll http1"); serviceMountPolling(); crashdumpMarkService("mount poll http1"); }
+  }
   { CRASHDUMP_SCOPE("restart"); PROFILE_SCOPE(PROFILE_RESTART); serviceRestart(); crashdumpMarkService("restart"); }
   { CRASHDUMP_SCOPE("mount poll restart"); serviceMountPolling(); crashdumpMarkService("mount poll restart"); }
 
@@ -4317,10 +4326,16 @@ void loop() {
     { CRASHDUMP_SCOPE("async slew"); serviceAsyncSlew(); crashdumpMarkService("async slew"); }
   } else {
     if (bridgeModeHasWebUi()) { CRASHDUMP_SCOPE("http web-only"); diagnosticServiceBegin("http-web-only"); serviceHttpServers(); diagnosticServiceEnd(); crashdumpMarkService("http web-only"); }
-    else { CRASHDUMP_SCOPE("tiny setup"); serviceTinySetupServer(); crashdumpMarkService("tiny setup"); }
-    { CRASHDUMP_SCOPE("mount poll webonly"); serviceMountPolling(); crashdumpMarkService("mount poll webonly"); }
+    else if (bridgeMode != BRIDGE_MODE_BT_MIN_WEB || bluetoothTinyWebRuntimeEnabled()) {
+      CRASHDUMP_SCOPE("tiny setup"); serviceTinySetupServer(); crashdumpMarkService("tiny setup");
+    }
+    if (bridgeMode != BRIDGE_MODE_BT_MIN_WEB) {
+      { CRASHDUMP_SCOPE("mount poll webonly"); serviceMountPolling(); crashdumpMarkService("mount poll webonly"); }
+    }
     { CRASHDUMP_SCOPE("telnet"); serviceTelnetConsole(); crashdumpMarkService("telnet"); }
-    { CRASHDUMP_SCOPE("mount poll telnet"); serviceMountPolling(); crashdumpMarkService("mount poll telnet"); }
+    if (bridgeMode != BRIDGE_MODE_BT_MIN_WEB) {
+      { CRASHDUMP_SCOPE("mount poll telnet"); serviceMountPolling(); crashdumpMarkService("mount poll telnet"); }
+    }
     if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
       { CRASHDUMP_SCOPE("bt lx200"); handleBluetoothLX200(); crashdumpMarkService("bt lx200"); }
       { CRASHDUMP_SCOPE("bt wifi coexist"); serviceBluetoothClientWifiCoexistence(); crashdumpMarkService("bt wifi coexist"); }

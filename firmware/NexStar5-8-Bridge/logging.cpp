@@ -110,6 +110,12 @@ void addLogLine(const String &line) {
 void logPrintfCat(int level, uint16_t cat, const char* fmt, ...) {
   if (!firmwareLoggingEnabled) return;
   if (LOG_LEVEL < level) return;
+#if defined(ESP32)
+  // BT Telnet mode must preserve heap for Bluetooth, Wi-Fi, and the console.
+  // Keep errors and warnings, but avoid constructing verbose temporary Strings
+  // when the mode cannot expose the full Web/logging surface anyway.
+  if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB && level > LOG_WARN) return;
+#endif
   if ((LOG_SUBSYSTEM_MASK & cat) == 0) return;
 
   char msg[220];
@@ -139,6 +145,9 @@ void logPrintfCat(int level, uint16_t cat, const char* fmt, ...) {
 void logPrintf(int level, const char* tag, const char* fmt, ...) {
   if (!firmwareLoggingEnabled) return;
   if (LOG_LEVEL < level) return;
+#if defined(ESP32)
+  if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB && level > LOG_WARN) return;
+#endif
   if ((LOG_SUBSYSTEM_MASK & LOG_CAT_SYSTEM) == 0) return;
 
   char msg[220];

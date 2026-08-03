@@ -3,6 +3,9 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $BuildDir = Join-Path $Root ".build\esp32"
 $OutDir = Join-Path $Root "dist"
 New-Item -ItemType Directory -Force -Path $BuildDir, $OutDir | Out-Null
+Get-ChildItem -LiteralPath $OutDir -File |
+  Where-Object { $_.Extension -in '.bin', '.elf', '.hex', '.map', '.eep' } |
+  Remove-Item -Force
 arduino-cli compile `
   --fqbn "esp32:esp32:esp32:PartitionScheme=huge_app" `
   --build-path $BuildDir `

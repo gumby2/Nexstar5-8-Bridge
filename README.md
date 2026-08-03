@@ -35,7 +35,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --build-pa
 Upload the compiled image from `dist/`:
 
 ```bash
-arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --input-dir dist --verify
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --input-file dist/NexStar5-8-Bridge.ino.bin --verify
 ```
 
 The HTTPS setup server requires local certificate and private-key material.

@@ -65,7 +65,7 @@ Compile and upload from the repository root:
 
 ```sh
 arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --build-path .build/esp32 --output-dir dist --jobs 2 firmware/NexStar5-8-Bridge
-arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --input-dir dist --verify
+arduino-cli upload -p <PORT> --fqbn esp32:esp32:esp32:PartitionScheme=huge_app --input-file dist/NexStar5-8-Bridge.ino.bin --verify
 ```
 
 On Windows, `<PORT>` is usually something like `COM12`. The same workflow is
