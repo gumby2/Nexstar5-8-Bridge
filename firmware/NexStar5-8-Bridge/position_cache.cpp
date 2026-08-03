@@ -17,6 +17,7 @@ static unsigned long mountRecoveryUntilMs = 0;
 static uint8_t consecutiveMountCommandFailures = 0;
 static const unsigned long MOUNT_SINGLE_FAIL_RECOVERY_MS = 8000;
 static const unsigned long MOUNT_MULTI_FAIL_RECOVERY_MS = 20000;
+static const unsigned long BT_MOUNT_POLL_MAX_DEFERRAL_MS = 5000;
 
 static const uint8_t BACKGROUND_POLL_FAIL_LIMIT = 3;
 uint8_t backgroundPollFailCount = 0;
@@ -263,22 +264,22 @@ void serviceMountPolling() {
     return;
   }
 
-  // Bluetooth SkySafari and Telnet share the single Arduino loop. Defer a
-  // background E poll briefly after BT traffic so a mount handshake cannot
-  // make the Telnet client wait behind the SkySafari transaction.
-  if (bluetoothMountPollQuietWindowActive()) {
-    if (nextMountPollDueMs == 0 || (long)(nowMs - nextMountPollDueMs) >= 0) {
-      nextMountPollDueMs = nowMs + activePollMs;
-    }
-    return;
-  }
-
   if (nextMountPollDueMs == 0) {
     nextMountPollDueMs = nowMs + activePollMs;
     return;
   }
 
   if ((long)(nowMs - nextMountPollDueMs) < 0) return;
+
+  // Bluetooth SkySafari and Telnet share the single Arduino loop. Defer a
+  // background E poll briefly after BT traffic so a mount handshake cannot
+  // make the Telnet client wait behind the SkySafari transaction. Do not let
+  // frequent SkySafari polling starve the cache indefinitely: once a poll has
+  // been due for the bounded maximum deferral, refresh the mount anyway.
+  if (bluetoothMountPollQuietWindowActive() &&
+      nowMs - nextMountPollDueMs < BT_MOUNT_POLL_MAX_DEFERRAL_MS) {
+    return;
+  }
 
   if (mountBusy || mountPollingBlocked()) {
     mountPollsDeferredBusy++;
