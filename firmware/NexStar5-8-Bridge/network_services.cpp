@@ -417,7 +417,9 @@ static WiFiServer& telnetServer() {
   return *telnetServerPtr;
 }
 
-static const unsigned long TELNET_SOCKET_WRITE_TIMEOUT_MS = 40UL;
+// Match the bounded nonblocking output window below. The ESP32 output guard
+// still limits each buffered write and drops only a genuinely stalled client.
+static const unsigned long TELNET_SOCKET_WRITE_TIMEOUT_MS = 250UL;
 static const unsigned long TELNET_OUTPUT_BUDGET_MS = 250UL;
 
 class TelnetOutputGuard : public Print {
