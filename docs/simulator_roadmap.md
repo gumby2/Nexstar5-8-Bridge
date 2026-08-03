@@ -19,5 +19,6 @@ transaction state, recovery pause, final cached coordinates, minimum heap when
 run on hardware, and listener reachability. The simulator must assert that no
 new mount command is forwarded while a prior command remains active.
 
-Implementation should wait until the canonical source-tree decision is made so
-the simulator vectors target the same transaction code used by the firmware.
+The simulator vectors should target the canonical v7.03 transaction behavior.
+Future firmware releases should update the vectors only after the corresponding
+hardware validation is complete.

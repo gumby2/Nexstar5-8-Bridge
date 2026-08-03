@@ -1,5 +1,9 @@
 # Client and endpoint matrix
 
+Default v1.0.0 ports are HTTP 80, Telnet 23, SkySafari/LX200 4030,
+Stellarium 10001, Alpaca HTTP 11111, and Alpaca discovery UDP 32227. Port
+settings may be changed in Setup; use device status output as authoritative.
+
 | Client or service | Transport / port | Position reads | GOTO / motion | Response source | Notes |
 | --- | --- | --- | --- | --- | --- |
 | SkySafari Wi-Fi | LX200 TCP / `LX200_PORT` | Cached position or async mount read | Queued RA/Dec or Alt/Az path | LX200 text | Single-command mount rules apply. |

@@ -6,7 +6,7 @@ The primary build target is a classic ESP32 Dev Module using Arduino ESP32 core 
 
 - Windows 11 host.
 - WSL Ubuntu shell for normal build and validation commands.
-- Example repository path in WSL: `/mnt/c/Users/scott/Documents/nexstar-protocol-converter-esp32-chatgpt/repository/nexstar-protocol-converter`.
+- Example repository path in WSL: `/mnt/c/Users/scott/Documents/Nexstar5-8-Bridge-v1`.
 - Portable Arduino CLI default: `$HOME/nexstar-portable-dev/arduino-cli`.
 - FQBN: `esp32:esp32:esp32:PartitionScheme=huge_app`.
 
@@ -53,7 +53,7 @@ Wrong branch:
 
 ```sh
 git status --short --branch
-git switch refactor/modularize-firmware
+git switch main
 ```
 
 Dirty tree:
@@ -66,7 +66,7 @@ git diff --stat
 Generated build folder inside firmware source:
 
 ```sh
-git status --short --ignored firmware/Nexstar_Protocol_Converter/build
+git status --short --ignored firmware/Nexstar_Protocol_Converter_v7.03/build
 ```
 
 Failed compile log capture:

@@ -10,10 +10,11 @@
 - HTTPS credentials extracted.
 - Logging subsystem extracted.
 
-## Current baseline: v7.03
+## Current baseline: repository v1.0.0 / firmware v7.03
 
 - Preserve the validated v7.03 behavior.
-- Keep v7.03 as the canonical build source until a later release is validated.
+- Keep the v7.03 source as the canonical build source until a later release is
+  validated.
 - Expand repeatable client and mount-fault testing without changing firmware
   behavior.
 
@@ -23,7 +24,7 @@
 - Automated web-interface tests.
 - SkySafari/LX200 simulation.
 - Alpaca simulation.
-- Release automation and tagged GitHub Releases.
+- Automated tagged GitHub releases.
 
 ## Future
 

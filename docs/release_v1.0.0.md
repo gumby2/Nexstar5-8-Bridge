@@ -1,19 +1,18 @@
-# v7.03 release and baseline record
+# v1.0.0 release and baseline record
 
 ## Source and hardware
 
 - Committed source: `firmware/Nexstar_Protocol_Converter_v7.03`
-- Original validation source: `C:\Users\scott\Downloads\Nexstar_Protocol_Converter_v7.03`
 - Target: classic ESP32 Dev Module, Huge APP partition
 - Arduino ESP32 core used for validation: 3.3.11
 - Test port: COM12
 - Network address during validation: `192.168.0.104`
 
-The v7.03 source is the modular v6.99-derived source tree now committed in the
-repository. The repository snapshot reuses the existing HTTPS certificate
-include rather than duplicating private key material.
+This repository release packages the validated v7.03 firmware. The snapshot
+reuses the existing HTTPS certificate include rather than duplicating private
+key material. The firmware continues to identify itself as v7.03.
 
-## Changes documented by this release
+## Included firmware baseline
 
 - Telnet GOTO RA/Dec and Alt/Az commands share Web UI safety and asynchronous
   slew queuing.
@@ -39,5 +38,6 @@ include rather than duplicating private key material.
 - Telnet menu navigation through Control, Status, Setup, and Back completed.
 - Invalid Telnet GOTO arguments were rejected without issuing a mount command.
 
-This is a validation record, not a Git tag. A formal tag should wait until the
-full compatibility matrix is complete.
+The repository is tagged `v1.0.0`. The compatibility matrix records coverage
+that remains partial or pending; this tag identifies the stable starting point,
+not completion of every planned client test.

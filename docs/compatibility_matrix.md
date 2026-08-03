@@ -1,5 +1,7 @@
 # Compatibility and stability matrix
 
+This matrix describes repository v1.0.0 and its v7.03 firmware baseline.
+
 Status values:
 
 - **Checked** — exercised during the current v7.03 validation sequence.

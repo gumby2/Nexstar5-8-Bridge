@@ -1,24 +1,22 @@
 # Cleanup plan audit
 
-This audit checks the original cleanup plan after the v6.99 documentation and
-v7.03 validation work.
+This audit records the documentation state of repository v1.0.0, based on the
+validated v7.03 firmware.
 
 | Original item | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Freeze a known-good baseline | Partial | v7.03 now has a hardware validation record; a formal Git tag and complete baseline record remain desirable. |
+| Freeze a known-good baseline | Complete | Repository v1.0.0 is tagged and the v7.03 hardware baseline is recorded. |
 | Establish repository structure | Complete | Source, docs, tools, scripts, simulator, and hardware areas are documented; local artifacts are ignored. |
-| Reduce source duplication | Partial | Release snapshots remain intentionally; the older development sketch and historical v5 trees still need retirement or generated-source policy. |
+| Reduce source duplication | Partial | Historical snapshots remain archival and are documented as such. |
 | Architecture and functional documentation | Complete | Architecture prose plus Mermaid block, loop, request-path, and state-machine diagrams are present, with v7.03 parity and browser-compatibility notes. |
 | Console/Web help | Complete | Console help, Telnet/Web parity, recovery, and Web endpoint documentation are present. |
 | Repeatable validation | Partial | Browser checks and transaction vectors exist; a full serial/network mount emulator and automated client suites remain future work. |
 | Hardware validation | Partial | v7.03 was compiled/flashed and checked on COM12 with help, Web, Telnet, and mount transactions; a complete post-cleanup SkySafari/Alpaca/Stellarium matrix remains. |
-| Narrow commits | Complete | Cleanup, docs/diagrams, help/release, and transaction vectors are separate commits on the refactor branch. |
+| Narrow commits | Complete | The v1.0.0 baseline and documentation cleanup are separate commits. |
 
 ## Next recommended work
 
 1. Generate the Web UI endpoint/reference table from route registration.
-2. Add a formal v7.03 Git tag after the full compatibility matrix passes.
-3. Decide whether the development sketch should be promoted from the current
-   modular source or generated from the latest validated release snapshot.
-4. Expand the simulator into delayed-response and malformed-response integration
-   tests after the canonical source-tree decision.
+2. Expand the simulator into delayed-response and malformed-response integration
+   tests against the canonical v7.03 transaction behavior.
+3. Complete the remaining client and long-duration hardware coverage.

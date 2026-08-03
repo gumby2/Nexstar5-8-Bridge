@@ -7,7 +7,8 @@ NexStar mount while preserving the mount's single-command protocol behavior.
 
 This v1.0.0 repository release is based on the validated v7.03 firmware. Its
 canonical source is `firmware/Nexstar_Protocol_Converter_v7.03`; see
-`docs/release_v7.03.md` for the hardware validation record. The older
+[`docs/release_v1.0.0.md`](docs/release_v1.0.0.md) for the hardware validation
+record. The older
 unversioned sketch is retained for comparison only.
 
 ## Target
@@ -42,17 +43,26 @@ being tested. Do not overwrite a published release snapshot in place.
 
 ## Documentation map
 
-- `docs/architecture.md` - module ownership and runtime invariants.
-- `docs/diagrams.md` - rendered architecture, runtime, protocol-flow, and recovery diagrams.
-- `docs/release_v7.03.md` - v7.03 build, flash, and validation baseline.
-- `docs/compatibility_matrix.md` - current Web, Telnet, protocol-client, and stability coverage.
-- `docs/telnet_web_parity.md` - shared actions and browser-only behavior.
-- `docs/protocol.md` - mount transaction rules and recovery boundaries.
-- `docs/protocol_stack.md` - client request paths through the firmware.
-- `docs/client_matrix.md` - client capabilities, ports, and response behavior.
-- `docs/web_endpoints.md` - Web UI, HTTPS, and Alpaca route inventory.
-- `docs/recovery_runbook.md` - diagnostic and recovery procedure.
-- `docs/build_environment.md` - reproducible build and validation workflow.
-- `docs/repository_layout.md` - source, release, tooling, and local-artifact policy.
-- `docs/testing.md` - software and hardware validation expectations.
-- `docs/console_help.md` - serial/Telnet command descriptions and diagnostics.
+Start here:
+
+- [`docs/build_guide.md`](docs/build_guide.md) - Windows, Arduino IDE, and CLI setup.
+- [`docs/release_checklist.md`](docs/release_checklist.md) - repeatable release validation.
+- [`docs/release_v1.0.0.md`](docs/release_v1.0.0.md) - this release's baseline record.
+
+Understand the system:
+
+- [`docs/architecture.md`](docs/architecture.md) - module ownership and invariants.
+- [`docs/diagrams.md`](docs/diagrams.md) - architecture and protocol-flow diagrams.
+- [`docs/protocol.md`](docs/protocol.md) - mount transaction and recovery rules.
+- [`docs/client_matrix.md`](docs/client_matrix.md) - clients and service ports.
+- [`docs/web_endpoints.md`](docs/web_endpoints.md) - Web, HTTPS, and Alpaca routes.
+
+Operate and troubleshoot:
+
+- [`docs/console_help.md`](docs/console_help.md) - serial/Telnet commands.
+- [`docs/telnet_web_parity.md`](docs/telnet_web_parity.md) - console/Web behavior.
+- [`docs/recovery_runbook.md`](docs/recovery_runbook.md) - network and mount recovery.
+- [`docs/compatibility_matrix.md`](docs/compatibility_matrix.md) - tested coverage.
+
+For repository policy, testing, memory, simulator, and layout details, see the
+remaining documents in [`docs/`](docs/).
