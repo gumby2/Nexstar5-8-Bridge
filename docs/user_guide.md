@@ -46,6 +46,21 @@ or deployment source; it is intentionally ignored and must never be committed.
 The tracked wrapper at
 `firmware/NexStar5-8-Bridge/https_credentials.h` includes that local file.
 
+The compressed Web UI header is already included in the repository. A normal
+clone does not require an asset-generation step: the compiler uses
+`firmware/NexStar5-8-Bridge/web_ui_asset.h` directly. If you edit the embedded
+Web UI in `NexStar5-8-Bridge.ino`, regenerate the deterministic gzip/PROGMEM
+header before compiling and commit the resulting header:
+
+```sh
+python3 firmware/NexStar5-8-Bridge/tools_generate_web_asset.py
+```
+
+The generator uses gzip compression level 9 and the firmware streams the
+result directly from flash with `Content-Encoding: gzip`; it is not inflated
+into the ESP32 heap. Do not regenerate or edit the header merely to download,
+compile, or upload an unchanged release.
+
 Compile and upload from the repository root:
 
 ```sh
