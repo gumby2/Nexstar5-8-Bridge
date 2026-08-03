@@ -6,12 +6,6 @@ Included firmware identity: **v7.03**
 This is an operator guide for setting up and using the bridge. Open only the
 task you need. Technical details are linked from the relevant section.
 
-<p id="top"><strong>Navigation</strong></p>
-
-[Quick start](#quick-start) · [Web UI](#web-ui) · [Setup](#setup) ·
-[Clients](#clients) · [Telnet](#telnet) · [Mount operation](#mount-operation) ·
-[Troubleshooting](#troubleshooting) · [Update](#update-firmware)
-
 <details open>
 <summary id="quick-start"><strong>Quick start: get connected</strong></summary>
 
@@ -27,7 +21,6 @@ task you need. Technical details are linked from the relevant section.
 If the Web UI does not open, start with the [troubleshooting section](#troubleshooting),
 then use the [recovery runbook](recovery_runbook.md).
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -48,7 +41,6 @@ usually indicates a browser-side issue rather than missing device data.
 See [`web_endpoints.md`](web_endpoints.md) for the route inventory and
 [`telnet_web_parity.md`](telnet_web_parity.md) for Web/Telnet differences.
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -71,7 +63,6 @@ Default ports are HTTP 80, Telnet 23, LX200 4030, Stellarium 10001, Alpaca
 HTTP 11111, and Alpaca discovery UDP 32227. The device's Status output is the
 authority if ports have been changed.
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -90,7 +81,6 @@ reads work, add GOTO testing, then test simultaneous Web/Telnet activity.
 All clients share the mount's single-command transport. A client may receive a
 cached or estimated position while a GOTO is active; this is expected behavior.
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -112,7 +102,6 @@ bytes; it can leave data for the next mount transaction.
 
 See [`console_help.md`](console_help.md) for the complete command reference.
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -133,7 +122,6 @@ the serial output before resetting anything.
 See [`protocol.md`](protocol.md) and [`recovery_runbook.md`](recovery_runbook.md)
 for the transaction and recovery rules.
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -174,7 +162,6 @@ browser is using the same device IP and protocol as the API request.
 
 More detailed procedures are in [`recovery_runbook.md`](recovery_runbook.md).
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -192,7 +179,6 @@ flashing, keep the serial monitor open at 115200 baud and verify:
 
 For a release candidate, follow [`release_checklist.md`](release_checklist.md).
 
-[Back to navigation](#top)
 </details>
 
 <details>
@@ -204,5 +190,4 @@ For a release candidate, follow [`release_checklist.md`](release_checklist.md).
 - [`protocol_stack.md`](protocol_stack.md) - request paths through the firmware.
 - [`diagrams.md`](diagrams.md) - functional and recovery diagrams.
 
-[Back to navigation](#top)
 </details>
