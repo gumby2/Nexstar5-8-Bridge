@@ -34,15 +34,27 @@ The project uses a CP2102 6-in-1 converter in TTL-to-RS-232 mode:
 | ESP32 GPIO17 TX | Converter TTL RX |
 | ESP32 GPIO16 RX | Converter TTL TX |
 | ESP32 GND | Converter TTL GND |
-| Converter 232-TX | NexStar cable DB-9 pin 3 |
-| Converter 232-RX | NexStar cable DB-9 pin 2 |
-| Converter GND | NexStar cable DB-9 pin 5 |
+
+The NexStar cable uses a 4P4C handset-style RJ22 plug. Looking into the plug
+from the contact/opening end, with the gold contacts facing you and the latch
+pointing down, number the contacts left-to-right 1 through 4:
+
+```text
+       1                 2                 3                 4
+    [  TX  ]           [ NC ]            [ GND ]            [  RX  ]
+    232-TX             unused             GND                232-RX
+```
+
+Connect RJ22 contact 1 to converter `232-TX`, contact 3 to converter `GND`,
+and contact 4 to converter `232-RX`. Leave contact 2 unconnected. This is the
+contact-side view; the order reverses when viewed from the cable-entry side or
+when the plug is flipped. Use contact numbers rather than wire colors.
 
 Set the converter to DIP 1 **OFF**, DIP 2 **OFF**, the `232-TTL / 232-485`
 selector to `232-TTL` / `UP`, and the voltage selector to `3V3`. Change switch
 positions only with power removed. Do not connect RS-232 pins to ESP32 GPIOs.
 
-The RS-232 cable plugs into the small RS-232 jack on the bottom of the NexStar
+The RJ22 cable plugs into the small RS-232 jack on the bottom of the NexStar
 hand controller—not the HAND CONTROL or AUX socket. The full wiring table and
 references are in [`hardware/wiring.md`](../hardware/wiring.md).
 

@@ -33,22 +33,47 @@ the physical board before applying these positions.
 
 ## NexStar RS-232 cable
 
-The Celestron hand-controller cable presents the computer side as a DB-9
-serial connection. Wire the converter's RS-232 header to the DB-9 side as:
+The Celestron cable uses a small 4P4C handset-style plug, commonly called an
+RJ22. It plugs into the dedicated **RS-232** jack on the bottom of the NexStar
+hand controller. Do not plug it into the **HAND CONTROL** or **AUX** socket.
 
-| Converter RS-232 pin | DB-9 pin | Function |
+### RJ22 plug orientation and pinout
+
+Look into the plug from the contact/opening end, with the gold contacts facing
+you and the locking latch pointing down. Number the four contact positions
+from left to right. With that orientation, connect the converter's RS-232
+header as follows:
+
+```text
+                 Looking into RJ22 plug contacts
+                 latch / locking tab pointing down
+
+       left                                             right
+        1                 2                 3                 4
+     [ TX ]            [ NC ]            [ GND ]            [ RX ]
+       |                 |                 |                 |
+       +-- converter     +-- leave        +-- converter      +-- converter
+           232-TX           unconnected      GND                 232-RX
+```
+
+| RJ22 contact | Connect to converter | Function |
 | --- | --- | --- |
-| 232-TX | 3 | Computer/mount transmit |
-| 232-RX | 2 | Computer/mount receive |
-| GND | 5 | Signal ground |
+| 1 | 232-TX | Converter transmit to mount |
+| 2 | No connection | Unused |
+| 3 | GND | Signal ground |
+| 4 | 232-RX | Mount transmit to converter |
 
-The other end of the cable plugs into the RS-232 jack on the bottom of the
-NexStar hand controller. This is not the hand-controller **HAND CONTROL** or
-**AUX** socket. Use the RS-232 cable supplied for, or correctly wired for, the
-NexStar controller; the RJ-22 cable is not a normal Ethernet cable.
+This is the contact-side view. If the plug is viewed from the cable-entry
+side, or flipped over, left and right are reversed. Do not use wire colors as
+the pin reference; handset cables can be reversed and colors vary. Use the
+contact number or verify each conductor with a continuity tester.
+
+The cable is a four-conductor RJ22 cable, not a normal Ethernet/RJ45 cable.
+Only the three contacts shown above are used by the mount serial interface.
 
 The mount protocol runs at 9600 baud, 8 data bits, no parity, and one stop bit.
 The firmware configures this automatically.
 
-References: [Celestron NexStar 5 manual RS-232 appendix](https://www.celestrondownloads.com/repository/_Manuals%20by%20Product%20Number/11031_nexstar_5_manual.pdf),
+References: [Celestron NexStar RS-232 cable diagram](https://www.nexstarsite.com/PCControl/RS232Cable.htm),
+[Celestron NexStar 5 manual](https://www.celestrondownloads.com/repository/_Manuals%20by%20Product%20Number/11031_nexstar_5_manual.pdf),
 [CP2102 6-in-1 converter manual](https://manuals.plus/asin/B0F37QWLYH.pdf).
