@@ -9,7 +9,8 @@ task you need. Technical details are linked from the relevant section.
 <details open>
 <summary id="quick-start"><strong>Quick start: get connected</strong></summary>
 
-1. Connect the mount UART using RX GPIO 16 and TX GPIO 17.
+1. Wire the ESP32, CP2102 6-in-1 converter, and NexStar RS-232 cable as shown
+   in [`hardware/wiring.md`](../hardware/wiring.md).
 2. Power the ESP32 and mount.
 3. Find the bridge's IP address from the serial console, router, or access-point
    setup.
@@ -20,6 +21,30 @@ task you need. Technical details are linked from the relevant section.
 
 If the Web UI does not open, start with the [troubleshooting section](#troubleshooting),
 then use the [recovery runbook](recovery_runbook.md).
+
+</details>
+
+<details>
+<summary><strong>Hardware: converter, cable, and switch settings</strong></summary>
+
+The project uses a CP2102 6-in-1 converter in TTL-to-RS-232 mode:
+
+| Connection | Destination |
+| --- | --- |
+| ESP32 GPIO17 TX | Converter TTL RX |
+| ESP32 GPIO16 RX | Converter TTL TX |
+| ESP32 GND | Converter TTL GND |
+| Converter 232-TX | NexStar cable DB-9 pin 3 |
+| Converter 232-RX | NexStar cable DB-9 pin 2 |
+| Converter GND | NexStar cable DB-9 pin 5 |
+
+Set the converter to DIP 1 **OFF**, DIP 2 **OFF**, the `232-TTL / 232-485`
+selector to `232-TTL` / `UP`, and the voltage selector to `3V3`. Change switch
+positions only with power removed. Do not connect RS-232 pins to ESP32 GPIOs.
+
+The RS-232 cable plugs into the small RS-232 jack on the bottom of the NexStar
+hand controller—not the HAND CONTROL or AUX socket. The full wiring table and
+references are in [`hardware/wiring.md`](../hardware/wiring.md).
 
 </details>
 
