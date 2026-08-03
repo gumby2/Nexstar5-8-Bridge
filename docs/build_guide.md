@@ -13,6 +13,11 @@ NexStar5/8-Bridge v1.0.0.
 5. Select the matching `.ino` file, choose the board's COM port, compile, and
    upload.
 
+The HTTPS setup server uses local certificate and private-key material. Before
+building, provide the ignored file `firmware/https_credentials.h`; the release
+source includes it from `firmware/NexStar5-8-Bridge/https_credentials.h`.
+Never commit that file or copy its private key into the public repository.
+
 The mount UART uses RX GPIO 16 and TX GPIO 17. Keep the serial monitor at
 115200 baud for boot and diagnostic output.
 
