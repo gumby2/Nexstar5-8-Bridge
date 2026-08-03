@@ -45,6 +45,7 @@ being tested. Do not overwrite a published release snapshot in place.
 
 Start here:
 
+- [`docs/user_guide.md`](docs/user_guide.md) - collapsible operator guide and quick actions.
 - [`docs/build_guide.md`](docs/build_guide.md) - Windows, Arduino IDE, and CLI setup.
 - [`docs/release_checklist.md`](docs/release_checklist.md) - repeatable release validation.
 - [`docs/release_v1.0.0.md`](docs/release_v1.0.0.md) - this release's baseline record.
