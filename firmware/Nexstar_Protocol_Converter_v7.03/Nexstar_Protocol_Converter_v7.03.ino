@@ -44,7 +44,7 @@
 #endif
 
 // ESP32 keeps AP fallback up, but saved STA credentials should survive reboot.
-const char* FW_VERSION = "v1.0.0-rc25";
+const char* FW_VERSION = "v2.0.0";
 const char* FW_NAME = "Nexstar5/8-Bridge";
 
 // Stability defaults: preserve all features, but avoid surprise background load.
