@@ -1,5 +1,4 @@
 #include <Arduino.h>
-#include "crashdump.h"
 #include "bluetooth_services.h"
 #include "console_commands.h"
 #include "https_setup_server.h"
@@ -45,14 +44,8 @@
 #endif
 
 // ESP32 keeps AP fallback up, but saved STA credentials should survive reboot.
-const bool ESP32_FORCE_AP_DEFAULTS = false;
-const bool ESP32_DISABLE_LITTLEFS_SETTINGS = true; // ESP32 uses Preferences/NVS instead
-const bool ESP32_BOOT_AP_ONLY = false;
-const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING = false;
-const bool ESP32_BOOT_WEB_ONLY = false;
-
-const char* FW_VERSION = "v7.03";
-const char* FW_NAME = "NexStar Protocol Converter";
+const char* FW_VERSION = "v1.0.0-rc25";
+const char* FW_NAME = "Nexstar5/8-Bridge";
 
 // Stability defaults: preserve all features, but avoid surprise background load.
 const bool WEB_STARTUP_READ_MOUNT = false;
@@ -64,8 +57,10 @@ extern const bool SERIAL_MIRROR_FULL_WIFI_LOGS = true; // mirror the same format
   #define HEARTBEAT_LED_ENABLED 1
   #define HEARTBEAT_LED_PIN 2
   #define HEARTBEAT_LED_ACTIVE_LOW 0
-  #define HEARTBEAT_INTERVAL_MS 2000UL
-  #define HEARTBEAT_LED_PULSE_MS 45UL
+  #define STATUS_LED_PULSE_MS 100UL
+  #define STATUS_LED_SLOW_INTERVAL_MS 3000UL
+  #define STATUS_LED_NORMAL_INTERVAL_MS 1000UL
+  #define STATUS_LED_FAST_INTERVAL_MS 300UL
 #endif
 
 
@@ -103,13 +98,28 @@ volatile char diagnosticLastService[24] = "boot";
 volatile unsigned long diagnosticServiceStartUs = 0;
 
 void diagnosticServiceBegin(const char* name) {
+#if defined(DISABLE_OPTIONAL_INSTRUMENTATION)
+  (void)name;
+  return;
+#else
   strncpy((char*)diagnosticLastService, name, sizeof(diagnosticLastService) - 1);
   ((char*)diagnosticLastService)[sizeof(diagnosticLastService) - 1] = '\0';
   diagnosticServiceStartUs = micros();
+#endif
 }
 
 void diagnosticServiceEnd() {
+#if defined(DISABLE_OPTIONAL_INSTRUMENTATION)
+  return;
+#else
   diagnosticLastServiceUs = micros() - diagnosticServiceStartUs;
+  if (diagnosticLastServiceUs >= 100000UL) {
+    Serial.printf("[DIAG] slow service=%s duration=%luus heap=%u\n",
+                  (const char*)diagnosticLastService,
+                  diagnosticLastServiceUs,
+                  ESP.getFreeHeap());
+  }
+#endif
 }
 
 void diagnosticMonitorTask(void*) {
@@ -135,12 +145,25 @@ void diagnosticServiceEnd() {}
 #endif
 
 #if defined(ESP32)
-unsigned long lastCrashdumpHeartbeatMs = 0;
-unsigned long heartbeatLedOffMs = 0;
-bool heartbeatLedPulsing = false;
+bool heartbeatLedOn = false;
+unsigned long statusLedNextMs = 0;
+unsigned long statusLedPulseOffMs = 0;
+
+enum StatusLedCondition : uint8_t {
+  STATUS_LED_IDLE = 0,
+  STATUS_LED_BT_WAIT,
+  STATUS_LED_ACTIVE,
+  STATUS_LED_WIFI_DEGRADED,
+  STATUS_LED_MOUNT_FAULT,
+  STATUS_LED_COMBINED_FAULT
+};
+
+uint8_t statusLedCondition = STATUS_LED_IDLE;
 
 void heartbeatLedWrite(bool on) {
 #if HEARTBEAT_LED_ENABLED
+  if (on == heartbeatLedOn) return;
+  heartbeatLedOn = on;
   digitalWrite(HEARTBEAT_LED_PIN, HEARTBEAT_LED_ACTIVE_LOW ? (on ? LOW : HIGH) : (on ? HIGH : LOW));
 #endif
 }
@@ -148,39 +171,64 @@ void heartbeatLedWrite(bool on) {
 void heartbeatLedBegin() {
 #if HEARTBEAT_LED_ENABLED
   pinMode(HEARTBEAT_LED_PIN, OUTPUT);
+  heartbeatLedOn = true;
   heartbeatLedWrite(false);
 #endif
 }
 
-void serviceHeartbeatLed() {
+void heartbeatLedSet(bool on) {
 #if HEARTBEAT_LED_ENABLED
-  if (heartbeatLedPulsing && millis() >= heartbeatLedOffMs) {
-    heartbeatLedWrite(false);
-    heartbeatLedPulsing = false;
+  heartbeatLedWrite(on);
+#endif
+}
+
+uint8_t currentStatusLedCondition() {
+  if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB && !bluetoothClientConnected()) return STATUS_LED_BT_WAIT;
+  const bool mountFault = mountCommFault;
+  const bool wifiFault = wifiRuntimeEnabled && staConfigured && (!staConnected || WiFi.status() != WL_CONNECTED);
+  if (mountFault && wifiFault) return STATUS_LED_COMBINED_FAULT;
+  if (mountFault) return STATUS_LED_MOUNT_FAULT;
+  if (wifiFault) return STATUS_LED_WIFI_DEGRADED;
+  if (bluetoothClientConnected() || lx200WifiClientConnected || stellariumClientConnected || (telnetClient && telnetClient.connected())) {
+    return STATUS_LED_ACTIVE;
   }
-#endif
+  return STATUS_LED_IDLE;
 }
 
-void pulseHeartbeatLed() {
-#if HEARTBEAT_LED_ENABLED
-  heartbeatLedWrite(true);
-  heartbeatLedOffMs = millis() + HEARTBEAT_LED_PULSE_MS;
-  heartbeatLedPulsing = true;
-#endif
+void statusLedSelectCondition(uint8_t next) {
+  if (next == statusLedCondition) return;
+  statusLedCondition = next;
+  statusLedNextMs = millis();
+  heartbeatLedSet(false);
 }
 
-void serviceFirmwareHeartbeat(const char *detail) {
-  serviceHeartbeatLed();
+void statusLedService() {
+  statusLedSelectCondition(currentStatusLedCondition());
+
+  if (statusLedCondition == STATUS_LED_IDLE) {
+    heartbeatLedSet(false);
+    return;
+  }
+  if (statusLedCondition == STATUS_LED_BT_WAIT || statusLedCondition == STATUS_LED_ACTIVE) {
+    heartbeatLedSet(true);
+    return;
+  }
+
   unsigned long now = millis();
-  if (now - lastCrashdumpHeartbeatMs < HEARTBEAT_INTERVAL_MS) return;
-  lastCrashdumpHeartbeatMs = now;
-  crashdumpHeartbeat(detail);
-  pulseHeartbeatLed();
+  if (heartbeatLedOn && (long)(now - statusLedPulseOffMs) >= 0) heartbeatLedWrite(false);
+  if ((long)(now - statusLedNextMs) < 0) return;
+
+  const bool combinedFault = statusLedCondition == STATUS_LED_COMBINED_FAULT;
+  const bool mountFault = statusLedCondition == STATUS_LED_MOUNT_FAULT;
+  const unsigned long interval = combinedFault ? STATUS_LED_FAST_INTERVAL_MS :
+                                 mountFault ? STATUS_LED_SLOW_INTERVAL_MS :
+                                 STATUS_LED_NORMAL_INTERVAL_MS;
+  heartbeatLedWrite(true);
+  statusLedPulseOffMs = now + STATUS_LED_PULSE_MS;
+  statusLedNextMs = now + interval;
 }
 #else
-void serviceFirmwareHeartbeat(const char *detail) {
-  crashdumpHeartbeat(detail);
-}
+void statusLedService() {}
 #endif
 
 // Site/time updates received through Alpaca are staged here and applied from loop(),
@@ -286,6 +334,23 @@ String jsonEscape(const String &s) {
     else out += c;
   }
   return out;
+}
+
+static void appendJsonEscapedField(String &json, const char *name, const String &value, bool trailingComma = true) {
+  json += '"';
+  json += name;
+  json += "\":\"";
+  for (size_t i = 0; i < value.length(); i++) {
+    const char c = value[i];
+    if (c == '"') json += "\\\"";
+    else if (c == '\\') json += "\\\\";
+    else if (c == '\n') json += "\\n";
+    else if (c == '\r') json += "\\r";
+    else if (c == '\t') json += "\\t";
+    else json += c;
+  }
+  json += '"';
+  if (trailingComma) json += ',';
 }
 
 String htmlEscape(const String &s) {
@@ -570,80 +635,8 @@ String urlDecodeSimple(String s) {
 
 
 void handleSetModePage() {
-  String m = webServer->arg("mode");
-  m.toLowerCase();
-  String ret = requestedReturnUrl();
-  if (ret.length() == 0 || !ret.startsWith("http://")) ret = currentRequestBaseUrl();
-
-  if (m == "wifi") {
-    LOG_WEB_I("Explicit WiFi mode action accepted: /setmode mode=wifi");
-    saveBridgeMode(BRIDGE_MODE_WIFI_FULL);
-    String page;
-    page.reserve(900);
-    page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
-    page += F("<meta http-equiv='refresh' content='7;url=");
-    page += ret;
-    page += F("'><script>setTimeout(function(){location.replace('");
-    page += ret;
-    page += F("')},7000)</script></head><body><h3>Switched to Full WiFi web mode</h3><p>Rebooting...</p><p><a href='");
-    page += ret;
-    page += F("'>Open previous page</a></p></body></html>");
-    webServer->sendHeader("Cache-Control", "no-store");
-    webServer->send(200, "text/html", page);
-    delay(900);
-    ESP.restart();
-    return;
-  }
-
-  if (m == "wifi-noweb") {
-    LOG_WEB_I("Explicit WiFi no-web mode action accepted: /setmode mode=%s", m.c_str());
-    saveBridgeMode(BRIDGE_MODE_WIFI_SERVERS);
-    String page;
-    page.reserve(900);
-    page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
-    page += F("</head><body><h3>Switched to WiFi servers / no Web UI mode</h3><p>Rebooting...</p><p>Port 80 will be disabled. SkySafari, Stellarium, Alpaca, and Telnet remain active after restart.</p></body></html>");
-    webServer->sendHeader("Cache-Control", "no-store");
-    webServer->send(200, "text/html", page);
-    delay(900);
-    ESP.restart();
-    return;
-  }
-
-  if (m == "web") {
-    LOG_WEB_I("Explicit web-only mode action accepted: /setmode mode=web");
-    saveBridgeMode(BRIDGE_MODE_WEB_ONLY);
-    String page;
-    page.reserve(900);
-    page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
-    page += F("<meta http-equiv='refresh' content='7;url=");
-    page += ret;
-    page += F("'><script>setTimeout(function(){location.replace('");
-    page += ret;
-    page += F("')},7000)</script></head><body><h3>Switched to Web UI only mode</h3><p>Rebooting...</p><p>SkySafari, Alpaca, and Stellarium servers will be disabled. Telnet remains active.</p><p><a href='");
-    page += ret;
-    page += F("'>Open previous page</a></p></body></html>");
-    webServer->sendHeader("Cache-Control", "no-store");
-    webServer->send(200, "text/html", page);
-    delay(900);
-    ESP.restart();
-    return;
-  }
-
-  if (m == "bt") {
-    saveBluetoothLiteWebBootEnabled(false);
-    saveBridgeMode(BRIDGE_MODE_BT_MIN_WEB);
-    String page;
-    page.reserve(900);
-    page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
-    page += F("</head><body><h3>Switched to BT mode</h3><p>Rebooting into Telnet-only BT mode.</p><p>The web interface will not start in BT mode. Reconnect with Telnet after the controller restarts.</p></body></html>");
-    webServer->sendHeader("Cache-Control", "no-store");
-    webServer->send(200, "text/html", page);
-    delay(900);
-    ESP.restart();
-    return;
-  }
-
-  webServer->send(400, "text/plain", "Unknown mode");
+  webServer->send(410, "text/plain", "Startup mode selection was removed. Reset starts the Bluetooth window; GPIO27 grounded forces Bluetooth-only.");
+  return;
 }
 
 void tinySetupSendHtml(WiFiClient &c, const String &body) {
@@ -657,6 +650,14 @@ void tinySetupSendHtml(WiFiClient &c, const String &body) {
 void tinySetupSendJson(WiFiClient &c, const String &body) {
   c.print("HTTP/1.1 200 OK\r\n");
   c.print("Content-Type: application/json\r\n");
+  c.print("Cache-Control: no-store\r\n");
+  c.print("Connection: close\r\n\r\n");
+  c.print(body);
+}
+
+void tinySetupSendText(WiFiClient &c, const String &body) {
+  c.print("HTTP/1.1 200 OK\r\n");
+  c.print("Content-Type: text/plain; charset=utf-8\r\n");
   c.print("Cache-Control: no-store\r\n");
   c.print("Connection: close\r\n\r\n");
   c.print(body);
@@ -800,6 +801,17 @@ String tinyBtStatusJson() {
   json += "\"lx200BtLastCommand\":\"" + jsonEscape(lx200BtLastCommand) + "\",";
   json += "\"lx200BtLastReply\":\"" + jsonEscape(lx200BtLastReply) + "\",";
   json += "\"lx200BtLastUnhandled\":\"" + jsonEscape(lx200BtLastUnhandled) + "\",";
+  json += "\"lx200BtNoReplyCommands\":" + String(lx200BtNoReplyCommands) + ",";
+  json += "\"lx200BtLastNoReplyCommand\":\"" + jsonEscape(lx200BtLastNoReplyCommand) + "\",";
+  json += "\"btSppLastCloseStatus\":" + String(btSppLastCloseStatus) + ",";
+  json += "\"btSppLastCloseHandle\":" + String(btSppLastCloseHandle) + ",";
+  json += "\"btSppLastClosePortStatus\":" + String(btSppLastClosePortStatus) + ",";
+  json += "\"btSppLastCloseAsync\":" + String(btSppLastCloseAsync ? "true" : "false") + ",";
+  json += "\"btSppLastCloseMs\":" + String(btSppLastCloseMs) + ",";
+  json += "\"btSppCongestionEvents\":" + String(btSppCongestionEvents) + ",";
+  json += "\"btSppLastCongested\":" + String(btSppLastCongested ? "true" : "false") + ",";
+  json += "\"btTraceLastRx\":\"" + jsonEscape(String(btTraceLastRx)) + "\",";
+  json += "\"btTraceLastTx\":\"" + jsonEscape(String(btTraceLastTx)) + "\",";
   json += "\"mountCommFault\":" + String(mountCommFault ? "true" : "false") + ",";
   json += "\"mountBusy\":" + String(mountBusy ? "true" : "false") + ",";
   json += "\"mountUptime\":\"" + jsonEscape(formatMountUptime()) + "\",";
@@ -828,7 +840,6 @@ String tinySetupPage() {
   // BT mode intentionally serves only a very small navigation bar. Do not
   // construct observer/system status strings here: Classic Bluetooth and
   // WiFi share limited ESP32 heap and radio resources.
-  loadWiFiConfig();
   String page;
   page.reserve(3600);
 
@@ -845,7 +856,7 @@ String tinySetupPage() {
   page += F("body.themeLight{--bg:#f3f6fb;--bar:#e9eef7;--text:#172033;--line:#b9c5d8;--btn:#e4eaf4;--primary:#d4e7f7;--warn:#f1d9df}body.themeNight{--bg:#050000;--bar:#080000;--text:#ff4a4a;--line:#650000;--btn:#260000;--primary:#520000;--warn:#3a0000}.nightBtn.active{background:#7a0000!important;color:#ffb0b0!important;border-color:#ff3030!important}");
   page += F("@media(max-width:700px){.top{align-items:flex-start}.brand{font-size:16px}}</style><script>");
   page += F("let baseTheme=localStorage.getItem('baseTheme')||'dark',nightMode=localStorage.getItem('nightMode')==='1';function applyTheme(){document.body.classList.remove('themeLight','themeDark','themeNight');document.body.classList.add(nightMode?'themeNight':(baseTheme==='light'?'themeLight':'themeDark'));let n=document.getElementById('nightModeBtn');if(n)n.classList.toggle('active',nightMode)}function setBaseTheme(t){baseTheme=t==='light'?'light':'dark';nightMode=false;localStorage.setItem('baseTheme',baseTheme);localStorage.setItem('nightMode','0');applyTheme()}function toggleNight(){nightMode=!nightMode;localStorage.setItem('nightMode',nightMode?'1':'0');applyTheme()}document.addEventListener('DOMContentLoaded',applyTheme);");
-  page += F("</script></head><body><div class='top'><div class='brand'>");
+  page += F("async function updateBtStatus(){try{let r=await fetch('/btstatus?t='+Date.now(),{cache:'no-store'}),j=await r.json();let s=id=>document.getElementById(id);s('bt').textContent=j.bluetoothConnected?'connected':(j.bluetoothEnabled?'waiting':'disabled');s('ap').textContent=j.apIp||'?';s('sta').textContent=j.staConnected?(j.staIp||'?'):'not connected';s('mount').textContent=j.mountCommFault?'fault':(j.mountBusy?'busy':'ready');s('rx').textContent=j.lx200BtRxCommands||0;s('tx').textContent=j.lx200BtTxReplies||0;s('heap').textContent=(j.freeHeap||0)+' bytes';s('last').textContent=j.lx200BtLastCommand||'none';s('reply').textContent=j.lx200BtLastReply||'none';s('live').textContent='snapshot '+new Date().toLocaleTimeString()}catch(e){document.getElementById('live').textContent='status update failed'}}window.addEventListener('load',updateBtStatus);</script></head><body><div class='top'><div class='brand'>");
   page += FW_NAME;
   page += F(" ");
   page += FW_VERSION;
@@ -854,19 +865,9 @@ String tinySetupPage() {
   page += F("<button class='btn' type='button' onclick=\"setBaseTheme('light')\">Light</button>");
   page += F("<button class='btn' type='button' onclick=\"setBaseTheme('dark')\">Dark</button>");
   page += F("<a class='btn warn' href='/reboot'>Reboot</a>");
-  page += F("<a class='btn primary' href='/mode?radio=wifi'>Full WiFi Mode</a>");
+  page += F("<span class='btn' style='cursor:default'>BT startup window</span>");
   page += F("</div></div><main style='padding:12px;max-width:720px;margin:0 auto'>");
-  page += F("<form class='card' method='get' action='/wifi_save' style='background:#151c2f;border:1px solid #2b3654;border-radius:12px;padding:14px;margin:12px 0'>");
-  page += F("<h3 style='margin:4px 0 10px'>STA WiFi Setup</h3><input type='hidden' name='target' value='sta'>");
-  page += F("<label>STA SSID<br><input name='ssid' value='");
-  page += tinyEsc(staSsid);
-  page += F("' style='width:100%;max-width:100%;padding:10px;margin:6px 0 10px;background:#0a1122;color:var(--text);border:1px solid var(--line);border-radius:8px'></label>");
-  page += F("<label>STA Password<br><input name='pass' type='text' value='");
-  page += tinyEsc(staPass);
-  page += F("' style='width:100%;max-width:100%;padding:10px;margin:6px 0 10px;background:#0a1122;color:var(--text);border:1px solid var(--line);border-radius:8px'></label>");
-  page += F("<button class='btn primary' type='submit'>Save STA WiFi</button>");
-  page += F("<p style='font-size:13px;color:#a9b4cf;margin:10px 0 0'>Saves STA credentials and reboots into BT STA mode. SSID is required.</p>");
-  page += F("</form></main></body></html>");
+  page += F("<div class='card' style='background:#151c2f;border:1px solid #2b3654;border-radius:12px;padding:14px;margin:12px 0'><h3 style='margin:4px 0 10px'>Connection Status</h3><div>Bluetooth: <b id='bt'>loading...</b></div><div>AP address: <b id='ap'>loading...</b></div><div>STA address: <b id='sta'>loading...</b></div><div>Mount: <b id='mount'>loading...</b></div><div>SkySafari RX/TX: <b id='rx'>0</b> / <b id='tx'>0</b></div><div>Free heap: <b id='heap'>loading...</b></div><div>Last command: <b id='last'>none</b></div><div>Last reply: <b id='reply'>none</b></div><button class='btn' type='button' onclick='updateBtStatus()'>Refresh Status</button><div id='live' style='font-size:13px;color:#a9b4cf;margin-top:10px'>loading status snapshot...</div></div></main></body></html>");
   return page;
 }
 
@@ -934,49 +935,27 @@ void serviceTinySetupServer() {
     return;
   }
 
+  if (tinyPathOnly == "/bttrace") {
+    tinySetupSendText(c, bluetoothTraceHistoryText());
+    c.stop();
+    return;
+  }
+
   if (tinyPathOnly == "/btpoll") {
     int p = tinyQueryParam(req, "poll").toInt();
     if (p < 0) p = 0;
     if (p > 60000) p = 60000;
     pollIntervalMs = (unsigned long)p;
     resetMountPollScheduler();
-    bool saved = saveBluetoothLitePollInterval(pollIntervalMs);
+    bool saved = savePersistentSettings();
 
     tinySetupSendRedirect(c, "/");
     c.stop();
     return;
   }
 
-  String tinyModeRadio = tinyQueryParam(req, "radio");
-  tinyModeRadio.toLowerCase();
-  String tinyModeValue = tinyQueryParam(req, "mode");
-  tinyModeValue.toLowerCase();
-
-  if ((tinyPathOnly == "/mode" && tinyModeRadio == "wifi") ||
-      (tinyPathOnly == "/setmode" && tinyModeValue == "wifi")) {
-    LOG_WEB_I("Explicit WiFi mode action accepted: %s", tinyPath.c_str());
-    saveBridgeMode(BRIDGE_MODE_WIFI_FULL);
-    String ret = tinyQueryParam(req, "return");
-    if (!ret.startsWith("http://")) ret = String("http://") + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString()) + "/";
-    String page;
-    page.reserve(900);
-    page += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='7;url=");
-    page += ret;
-    page += F("'><script>setTimeout(function(){location.replace('");
-    page += ret;
-    page += F("')},7000)</script></head><body><h2>Full WiFi mode saved</h2><p>Rebooting into full WiFi mode...</p><p>The page should return to the same host automatically.</p><p><a href='");
-    page += ret;
-    page += F("'>Open main UI</a></p></body></html>");
-    tinySetupSendHtml(c, page);
-    c.stop();
-    delay(900);
-    ESP.restart();
-    return;
-  }
-
-  if (tinyPathOnly == "/mode" && tinyModeRadio == "bt") {
-    saveBridgeMode(BRIDGE_MODE_BT_MIN_WEB);
-    tinySetupSendRedirect(c, "/");
+  if (tinyPathOnly == "/mode" || tinyPathOnly == "/setmode") {
+    tinySetupSendText(c, "Startup mode selection was removed. Reset starts the Bluetooth window; GPIO27 grounded forces Bluetooth-only.\n");
     c.stop();
     return;
   }
@@ -1141,21 +1120,22 @@ void sendWebPage() {
 
   server.sendContent(F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><meta http-equiv='Cache-Control' content='no-store, no-cache, must-revalidate, max-age=0'><meta http-equiv='Pragma' content='no-cache'><meta http-equiv='Expires' content='0'><title>NexStar Converter</title>"));
   server.sendContent(F("<style>body{font-family:Arial,Helvetica,sans-serif;background:#0b1020;color:#edf2ff;margin:0;padding:10px;font-size:var(--ui-scale,16px)}.topbar{position:sticky;top:0;z-index:2;background:#080d1a;border:1px solid #2b3654;border-radius:12px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;box-shadow:0 1px 3px #0006}.scaleCtl{margin-left:auto;display:flex;align-items:center;gap:6px;background:#101729;border:1px solid #2b3654;border-radius:10px;padding:4px 6px;white-space:nowrap;flex-wrap:nowrap}.scaleCtl button{min-width:2em;padding:.25em .5em}.scaleCtl span{display:inline-block;min-width:2.7em;text-align:center;font-size:.95em}h2{margin:4px 0 10px}.topbar h2{font-size:18px;margin:0;font-weight:700}h3{margin:4px 0 8px}button,input,select{font-size:1em;margin:.2em;padding:.48em .55em;max-width:100%;box-sizing:border-box}input{width:120px;max-width:95%;border:1px solid #2b3654;background:#0a1122;color:#edf2ff;border-radius:8px}select{border:1px solid #2b3654;background:#0a1122;color:#edf2ff;border-radius:8px;color-scheme:dark;-webkit-appearance:auto;appearance:auto}select option{background:#0a1122;color:#edf2ff}select option:disabled{color:#7f899f!important;background:#101729!important}select option:checked{background:#174b80;color:#fff}input:focus,select:focus{outline:2px solid #4aa3ff;border-color:#4aa3ff}button{border-radius:9px;border:1px solid #2b3654;background:#1b2742;color:#edf2ff;font-weight:700;cursor:pointer}.quick{font-size:.9em;background:#151c2f;border:1px solid #2b3654;border-radius:12px;padding:8px;margin:8px 0;box-shadow:0 1px 3px #0006}.tabs{display:flex;gap:6px;overflow-x:auto;margin:8px 0 12px}.tabs button{white-space:nowrap;padding:8px 11px;background:#1b2742;border-color:#2b3654}.tabs button.active{background:#174b80;color:#edf2ff;font-weight:bold;border-color:#2b72b9}.tab{display:none}.tab.active{display:block}.grid{display:block}.tab .card{margin-bottom:10px}.card{background:#151c2f;padding:14px;border-radius:12px;border:1px solid #2b3654;min-width:0;box-shadow:0 1px 3px #0006}.row{display:flex;flex-wrap:wrap;align-items:center;gap:4px}.formrow{display:grid;grid-template-columns:150px minmax(0,1fr);gap:10px 12px;align-items:center;margin:9px 0}.formrow label{color:#a9b4cf;font-weight:bold;text-align:left}.formrow input,.formrow select{width:100%;max-width:100%;margin:0}.hint{font-size:13px;color:#a9b4cf;margin:8px 0 0 162px;line-height:1.35}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.pad{text-align:center}.pad button{min-width:5.5em;min-height:3.25em;font-size:1.15em}pre{background:#080d1a;color:#8dffba;border:1px solid #2b3654;padding:8px;overflow:auto;white-space:pre-wrap;border-radius:8px;min-height:260px}.small{font-size:13px;color:#a9b4cf}.msg{padding:6px;border-radius:8px;background:#101729;color:#edf2ff;border:1px solid #2b3654;margin:5px 0;min-height:18px}.ok{color:#8dffba}.bad{color:#ff8d8d}.health{font-size:18px;font-weight:bold;padding:8px;border-radius:8px;margin-bottom:6px;background:#101729;border:1px solid #2b3654}.alive{border-color:#8dffba!important}.busy{border-color:#ffcc66!important}.idle{border-color:#2b3654!important}.fault{border-color:#ff0000!important;animation:flash .7s infinite}@keyframes flash{0%{border-color:#ff0000}50%{border-color:#550000}100%{border-color:#ff0000}}@media (max-width:699px){.topbar{flex-wrap:wrap}.scaleCtl{margin-left:0;width:100%;max-width:100%;overflow-x:auto;box-sizing:border-box}.tabs{max-width:100%;box-sizing:border-box}.grid{grid-template-columns:1fr}.card{width:100%;box-sizing:border-box}.row{display:block}.formrow{grid-template-columns:1fr}.formrow label{text-align:left}.hint{margin-left:0}.row button,.row select{display:block;width:100%;margin:6px 0}.pad button{min-width:72px}.msg,pre{max-width:100%;overflow:auto}}@media (min-width:700px){.grid{display:block}.tab.active{display:grid;grid-template-columns:1fr 1fr;gap:10px}.status{grid-column:auto}.logs{grid-column:auto}.tab .card{margin-bottom:0}}@media (min-width:1100px){.tab.active{grid-template-columns:1fr 1fr 1fr}}.logAlert{font-weight:bold;color:#ffcc00;animation:blinkAlert 1s step-start infinite;cursor:pointer}.logAlert.off{display:none}@keyframes blinkAlert{50%{opacity:0}}.catBtns button{margin:4px}.catInfo{font-size:.9em;background:#101729;padding:6px;border-radius:8px;margin:6px 0;display:block;width:100%;box-sizing:border-box;border:1px solid #2b3654;color:#edf2ff;line-height:1.35}.dark .catInfo{background:#101729}.logs pre{height:360px;overflow-y:auto;scroll-behavior:auto}.loggrid{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:8px 18px;align-items:center;margin:8px 0}.loggrid label{display:grid;grid-template-columns:22px 1fr;align-items:center;column-gap:6px;margin:0;white-space:nowrap}.loggrid input[type=checkbox]{margin:0;width:18px;height:18px;justify-self:start}@media(max-width:520px){.loggrid{grid-template-columns:repeat(2,minmax(130px,1fr))}}.themeLight{background:#f3f5f8!important;color:#172033!important}.themeLight .topbar{background:#fff!important;border-color:#bcc5d2!important;box-shadow:0 1px 4px #0002}.themeLight .scaleCtl,.themeLight .quick,.themeLight .card,.themeLight .msg,.themeLight .health,.themeLight .catInfo{background:#fff!important;color:#172033!important;border-color:#bcc5d2!important;box-shadow:0 1px 3px #0002}.themeLight input,.themeLight select,.themeLight pre{background:#f8fafc!important;color:#172033!important;border-color:#aab4c2!important}.themeLight select{color-scheme:light!important}.themeLight select option{background:#f8fafc!important;color:#172033!important}.themeLight select option:disabled{background:#eef1f5!important;color:#8993a3!important}.themeLight select option:checked{background:#1769aa!important;color:#fff!important}.themeLight button,.themeLight .tabs button,.themeLight .badge{background:#e5eaf1!important;color:#172033!important;border-color:#aab4c2!important}.themeLight .tabs button.active{background:#1769aa!important;color:#fff!important;border-color:#12568c!important}.themeLight .formrow label,.themeLight .hint,.themeLight .small{color:#4b5668!important}.themeLight pre{color:#163b22!important}.themeNight{background:#050000!important;color:#ff3a3a!important}.themeNight *{text-shadow:none!important}.themeNight .topbar{background:#100000!important;border-color:#5a0000!important;box-shadow:none!important}.themeNight .scaleCtl,.themeNight .quick,.themeNight .card,.themeNight .msg,.themeNight .health,.themeNight .catInfo{background:#100000!important;color:#ff3a3a!important;border-color:#5a0000!important;box-shadow:none!important}.themeNight input,.themeNight select,.themeNight pre{background:#050000!important;color:#ff3a3a!important;border-color:#650000!important}.themeNight select{color-scheme:dark!important}.themeNight select option{background:#050000!important;color:#ff3a3a!important}.themeNight select option:disabled{background:#100000!important;color:#7f2020!important}.themeNight select option:checked{background:#5a0000!important;color:#ff7070!important}.themeNight button,.themeNight .tabs button,.themeNight .badge{background:#260000!important;color:#ff4a4a!important;border-color:#750000!important}.themeNight button:hover{background:#3a0000!important}.themeNight .tabs button.active{background:#5a0000!important;color:#ff7070!important;border-color:#a00000!important}.themeNight .formrow label,.themeNight .hint,.themeNight .small,.themeNight .ok,.themeNight .bad{color:#ff3a3a!important}.themeNight .alive,.themeNight .busy,.themeNight .idle,.themeNight .fault{border-color:#8a0000!important}.themeNight .logAlert{color:#ff3a3a!important}.nightBtn.active{background:#7a0000!important;color:#ffb0b0!important;border-color:#ff3030!important}.statusModeBtn.active{border-color:var(--accent)!important}.themeChoice{display:flex;gap:8px;flex-wrap:wrap}.themeChoice button.active{outline:2px solid #4aa3ff}.themeNight .themeChoice button.active{outline-color:#ff3030}.themeLight .themeChoice button.active{outline-color:#1769aa}.statusPair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;grid-column:1/-1}.statusPair>.card{margin-bottom:0}@media(max-width:760px){.statusPair{grid-template-columns:1fr}}input[type=checkbox]{accent-color:#1769aa}.themeDark input[type=checkbox]{accent-color:#4aa3ff}.themeLight input[type=checkbox]{accent-color:#1769aa}.themeNight input[type=checkbox]{accent-color:#d40000!important;filter:brightness(.9) saturate(1.4)}.themeNight input[type=checkbox]:checked{accent-color:#ff2020!important}</style>"));
+  server.sendContent(F("<style>.tipMarker{display:inline-flex;align-items:center;justify-content:center;width:1.05em;height:1.05em;margin-left:4px;border:1px solid #8cc7ff;border-radius:50%;color:#8cc7ff;font-size:.78em;font-weight:bold;line-height:1;cursor:help;vertical-align:middle;position:relative}.tipMarker:focus{outline:2px solid #4aa3ff}.tipMarker:after{content:attr(data-tooltip);position:absolute;z-index:20;left:50%;top:calc(100% + 7px);transform:translateX(-50%);width:250px;padding:8px 10px;border:1px solid #4aa3ff;border-radius:7px;background:#080d1a;color:#edf2ff;font-size:13px;font-weight:normal;line-height:1.35;text-align:left;white-space:normal;box-shadow:0 3px 10px #0009;opacity:0;visibility:hidden;pointer-events:none;transition:opacity .12s ease}.tipMarker:hover:after,.tipMarker:focus:after{opacity:1;visibility:visible}.themeLight .tipMarker:after{background:#fff;color:#172033;border-color:#1769aa}.themeNight .tipMarker:after{background:#100000;color:#ff3a3a;border-color:#a00000}</style>"));
+  server.sendContent(F("<style>.tipMarker,label span[title]{display:none!important}</style>"));
   server.sendContent(F("<script>"));
-  server.sendContent(F("function saveBridgeModeWeb(){let m=id('bridge_mode').value;let s=id('bridge_mode'),label=s&&s.selectedIndex>=0?s.options[s.selectedIndex].text:m;if(!confirm('Save bridge mode '+label+' and reboot now?'))return;location.href='/setmode?mode='+enc(m)+'&return='+enc(location.href)}function syncBridgeModeSelector(){let s=id('bridge_mode');if(!s||typeof lastStatus!=='object'||!lastStatus)return;setText('bridge_mode_current',lastStatus.bridgeMode||'?');if(s.dataset.dirty==='1'||document.activeElement===s)return;s.value=lastStatus.bridgeModeValue||'wifi';if(s._csHost&&typeof csSync==='function')csSync(s)}setInterval(syncBridgeModeSelector,1000);"));
   server.sendContent(F("const FW_VERSION='"));
   server.sendContent(FW_VERSION);
   server.sendContent(F("';let busy=false,uiScale=parseFloat(localStorage.getItem('uiScale')||'1'),baseTheme=localStorage.getItem('baseTheme')||'dark',nightMode=localStorage.getItem('nightMode')==='1',statusAdvanced=localStorage.getItem('statusAdvanced')==='1';function id(x){return document.getElementById(x)}function enc(v){return encodeURIComponent(v)}function cb(u){return u+(u.includes('?')?'&':'?')+'fw='+enc(FW_VERSION)+'&t='+Date.now()}function setMsg(n,t,c){let e=id(n);if(e){e.textContent=t;e.className='msg '+(c||'')}}function applyScale(){document.documentElement.style.setProperty('--ui-scale',(16*uiScale)+'px');let e=id('scalePct');if(e)e.textContent=Math.round(uiScale*100)+'%';localStorage.setItem('uiScale',uiScale.toFixed(2))}function scaleUi(d){uiScale=Math.max(0.7,Math.min(1.6,uiScale+d));applyScale()}function resetScale(){uiScale=1;applyScale()}function applyTheme(){document.body.classList.remove('themeLight','themeDark','themeNight');document.body.classList.add(nightMode?'themeNight':(baseTheme==='light'?'themeLight':'themeDark'));let cs=(!nightMode&&baseTheme==='light')?'light':'dark';document.documentElement.style.colorScheme=cs;document.querySelectorAll('select').forEach(e=>{e.style.colorScheme=cs});let nb=id('nightModeBtn');if(nb){nb.classList.toggle('active',nightMode);nb.textContent='Red'}let lb=id('themeLightBtn'),db=id('themeDarkBtn');if(lb)lb.classList.toggle('active',baseTheme==='light');if(db)db.classList.toggle('active',baseTheme==='dark')}function setBaseTheme(t){baseTheme=(t==='light')?'light':'dark';nightMode=false;localStorage.setItem('baseTheme',baseTheme);localStorage.setItem('nightMode','0');applyTheme()}function toggleNightMode(){nightMode=!nightMode;localStorage.setItem('nightMode',nightMode?'1':'0');applyTheme()}function applyStatusMode(){let a=id('statusAdvancedWrap'),b=id('statusBasicWrap'),btn=id('statusModeBtn');if(a)a.style.display=statusAdvanced?'grid':'none';if(b)b.style.display=statusAdvanced?'none':'grid';if(btn){btn.textContent=statusAdvanced?'Basic':'Advanced';btn.classList.toggle('active',statusAdvanced)}}function toggleStatusMode(){statusAdvanced=!statusAdvanced;localStorage.setItem('statusAdvanced',statusAdvanced?'1':'0');applyStatusMode()}function showTab(n){document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.tabs button').forEach(e=>e.classList.remove('active'));let t=id('tab_'+n);if(t)t.classList.add('active');let b=id('btn_'+n);if(b)b.classList.add('active');localStorage.setItem('activeTab',n)}function restoreTab(){showTab(localStorage.getItem('activeTab')||'control')}async function getText(u){let r=await fetch(cb(u),{cache:'no-store'});return await r.text()}async function getJson(u){let r=await fetch(cb(u),{cache:'no-store'});let t=await r.text();try{return JSON.parse(t)}catch(e){return {ok:r.ok,message:t||'OK'}}}async function jsonAction(url,msg,onOk,jsName){if(busy)return;busy=true;let el=id(msg);if(el){el.textContent='Working...';el.className='msg'}try{let full=url+(url.includes('?')?'&':'?')+'ajax=1';if(jsName)full+='&js='+enc(jsName);let j=await getJson(full);if(j.ok&&url.startsWith('/set_manual_site_time'))clearSiteDirty();if(j.ok&&url.startsWith('/setrates'))clearRateDirty();if(j.ok&&onOk)onOk();if(el){el.textContent=j.message||'OK';el.className='msg '+(j.ok?'ok':'bad')}if(j.ok&&j.redirectUrl){let d=Number(j.redirectDelayMs||1200);setTimeout(()=>{window.location.href=j.redirectUrl},d);busy=false;return}}catch(e){if(el){el.textContent='Request failed';el.className='msg bad'}}busy=false;setTimeout(updateNow,500)}"));
   server.sendContent(F("function setLog(l){setVal('logLevelSel',l);applyLogSettings()}function clearLogs(){let lb=id('logBox');if(lb)lb.textContent='';jsonAction('/clearlogs','logsMsg',function(){updateNow()},'clearLogs')}function clearLogAlert(){jsonAction('/clearlogalert','logsMsg',function(){updateNow()},'clearLogAlert')}function setRate(){jsonAction('/setwebrate?rate='+enc(id('rateSel').value),'mainMsg',null,'setRate')}function nudge(d){jsonAction('/webnudge?dir='+enc(d),'mainMsg',null,'nudge')}function readRaDec(){jsonAction('/getradecweb','gotoMsg',function(){setTimeout(updateNow,700);setTimeout(function(){updateNow();loadCurrentRaDecTarget()},1600)},'readRaDec')}function readAltAz(){jsonAction('/getaltazweb','altazMsg',function(){setTimeout(updateNow,700);setTimeout(function(){updateNow();loadCurrentAltAzTarget()},1600)},'readAltAz')}function startupReadAltAz(){fetch('/getaltazweb').then(()=>{setTimeout(updateNow,900);setTimeout(function(){if(!targetsInitialized&&lastStatus){setTargetRaDec(lastStatus.raHours,lastStatus.decDeg);setTargetAltAz(lastStatus.altDeg,lastStatus.azDeg);targetsInitialized=true}},1800)}).catch(()=>{})}"));
   server.sendContent(F("function julianFromStatus(){if(!lastStatus)return NaN;let ms=Date.UTC(lastStatus.localYear,lastStatus.localMonth-1,lastStatus.localDay,lastStatus.localHour,lastStatus.localMinute,lastStatus.localSecond)-Number(lastStatus.utcOffsetMinutes||0)*60000;return ms/86400000+2440587.5}function lstHours(){let jd=julianFromStatus();if(!isFinite(jd)||!lastStatus)return NaN;let T=(jd-2451545.0)/36525.0;let gmst=280.46061837+360.98564736629*(jd-2451545.0)+0.000387933*T*T-T*T*T/38710000.0;let lst=(gmst+Number(lastStatus.longitude))/15.0;lst=lst%24;if(lst<0)lst+=24;return lst}function radecToAltDeg(raHours,decDeg){if(!lastStatus||!lastStatus.siteValid||!lastStatus.timeValid)return NaN;let lat=Number(lastStatus.latitude)*Math.PI/180,dec=Number(decDeg)*Math.PI/180,ha=(lstHours()-Number(raHours))*15*Math.PI/180;let s=Math.sin(dec)*Math.sin(lat)+Math.cos(dec)*Math.cos(lat)*Math.cos(ha);return Math.asin(Math.max(-1,Math.min(1,s)))*180/Math.PI}function confirmAboveHorizonRaDec(ra,dec,msg){let alt=radecToAltDeg(ra,dec);if(!isFinite(alt)){setMsg(msg,'Cannot verify horizon: valid site/time required','bad');return false}if(alt<0){setMsg(msg,'Blocked by horizon safety: target Alt '+alt.toFixed(2)+' deg','bad');return false}let cb=id('alt_limit_enable');if(cb&&cb.checked){let mn=Number(id('alt_min').value),mx=Number(id('alt_max').value);if(isFinite(mn)&&isFinite(mx)&&mn<mx&&(alt<mn||alt>mx)){setMsg(msg,'Blocked by Alt limit: '+alt.toFixed(2)+' deg allowed '+mn.toFixed(2)+' to '+mx.toFixed(2),'bad');return false}}return true}function confirmAboveHorizonAltAz(alt,msg){let a=Number(alt);if(!isFinite(a)){setMsg(msg,'Invalid target altitude','bad');return false}if(a<0){setMsg(msg,'Blocked by horizon safety: target Alt '+a.toFixed(2)+' deg','bad');return false}let enabled=false,mn=0,mx=90;let cb=id('alt_limit_enable'),mi=id('alt_min'),ma=id('alt_max');if(cb){enabled=cb.checked;mn=Number(mi?mi.value:0);mx=Number(ma?ma.value:90)}else if(lastStatus){enabled=!!lastStatus.safeAltLimitEnabled;mn=Number(lastStatus.safeAltMinDeg);mx=Number(lastStatus.safeAltMaxDeg)}if(enabled){if(!isFinite(mn)||!isFinite(mx)||mn>=mx){setMsg(msg,'Invalid Alt safety limits','bad');return false}if(a<mn||a>mx){setMsg(msg,'Blocked by Alt limit: '+a.toFixed(2)+' deg allowed '+mn.toFixed(2)+' to '+mx.toFixed(2),'bad');return false}}return true}function confirmSafeDec(dec,msg){return true}function gotoRaDec(){let ra=Number(id('ra_hours').value),dec=Number(id('dec_deg').value);if(!isFinite(ra)||ra<0||ra>=24){setMsg('gotoMsg','RA must be from 0 up to, but not including, 24 hours','bad');return}if(!isFinite(dec)||dec<-90||dec>90){setMsg('gotoMsg','Declination must be from -90 to +90 degrees','bad');return}if(!confirmAboveHorizonRaDec(ra,dec,'gotoMsg'))return;jsonAction('/webgoto_radec?ra_hours='+enc(ra)+'&dec_deg='+enc(dec),'gotoMsg',function(){setTimeout(updateNow,1200)},'gotoRaDec')}function gotoAltAz(){let alt=Number(id('alt_deg').value),az=Number(id('az_deg').value);if(!isFinite(alt)||alt<-90||alt>90){setMsg('altazMsg','Altitude must be from -90 to +90 degrees','bad');return}if(!isFinite(az)||az<0||az>=360){setMsg('altazMsg','Azimuth must be from 0 up to, but not including, 360 degrees','bad');return}if(!confirmAboveHorizonAltAz(alt,'altazMsg'))return;jsonAction('/webgoto_altaz?alt_deg='+enc(alt)+'&az_deg='+enc(az),'altazMsg',function(){setTimeout(updateNow,1200)},'gotoAltAz')}"));
   server.sendContent(F("function saveAltLimits(){let en=id('alt_limit_enable').checked?1:0;jsonAction('/setaltlimits?enabled='+en+'&min='+enc(id('alt_min').value)+'&max='+enc(id('alt_max').value),'altLimitMsg',function(){clearFieldsDirty(['alt_limit_enable','alt_min','alt_max']);setTimeout(updateNow,300)},'saveAltLimits')}function saveDecLimits(){let en=id('dec_limit_enable').checked?1:0;jsonAction('/setdeclimits?enabled='+en+'&min='+enc(id('dec_min').value)+'&max='+enc(id('dec_max').value),'decLimitMsg',function(){clearFieldsDirty(['dec_limit_enable','dec_min','dec_max']);setTimeout(updateNow,300)},'saveDecLimits')}function saveRates(){jsonAction('/setrates?r1='+enc(id('r1').value)+'&r2='+enc(id('r2').value)+'&r3='+enc(id('r3').value)+'&r4='+enc(id('r4').value),'settingsMsg',null,'saveRates')}function resetRates(){jsonAction('/resetrates','settingsMsg',null,'resetRates')}"));
-  server.sendContent(F("function saveManualSiteTime(){jsonAction('/set_manual_site_time?lat='+enc(id('lat').value)+'&lon='+enc(id('lon').value)+'&offset='+enc(id('offset').value)+'&year='+enc(id('year').value)+'&month='+enc(id('month').value)+'&day='+enc(id('day').value)+'&hour='+enc(id('hour').value)+'&minute='+enc(id('minute').value)+'&second='+enc(id('second').value)+'&poll='+enc(id('poll').value)+'&idlepoll='+enc(id('idlepoll').value)+'&handshake='+enc(id('handshake').value)+'&throttle='+enc(id('throttle').value),'siteMsg',null,'saveManualSiteTime')}function startHttpsTimeLocation(){setMsg('siteMsg','Starting GPS Sync HTTPS server...','ok');let ret=location.href;fetch(cb('/start_https?json=1&return='+enc(ret)),{cache:'no-store'}).then(r=>r.text()).then(t=>{let j=null;try{j=JSON.parse(t)}catch(e){throw new Error('bad GPS Sync response: '+t.slice(0,80))}if(j.ok&&j.url){setMsg('siteMsg','Opening GPS Sync HTTPS page. Accept the certificate warning if shown.','ok');setTimeout(()=>{location.href=j.url},700)}else setMsg('siteMsg',j.error||'GPS Sync start failed','bad')}).catch(e=>setMsg('siteMsg','GPS Sync start failed: '+e,'bad'))}"));
+  server.sendContent(F("function saveManualSiteTime(){jsonAction('/set_manual_site_time?lat='+enc(id('lat').value)+'&lon='+enc(id('lon').value)+'&offset='+enc(id('offset').value)+'&year='+enc(id('year').value)+'&month='+enc(id('month').value)+'&day='+enc(id('day').value)+'&hour='+enc(id('hour').value)+'&minute='+enc(id('minute').value)+'&second='+enc(id('second').value)+'&poll='+enc(id('poll').value)+'&idlepoll='+enc(id('idlepoll').value)+'&handshake='+enc(id('handshake').value)+'&throttle='+enc(id('throttle').value)+'&btwait='+enc(id('btwait').value),'siteMsg',null,'saveManualSiteTime')}function startHttpsTimeLocation(){setMsg('siteMsg','Starting GPS Sync HTTPS server...','ok');let ret=location.href;fetch(cb('/start_https?json=1&return='+enc(ret)),{cache:'no-store'}).then(r=>r.text()).then(t=>{let j=null;try{j=JSON.parse(t)}catch(e){throw new Error('bad GPS Sync response: '+t.slice(0,80))}if(j.ok&&j.url){setMsg('siteMsg','Opening GPS Sync HTTPS page. Accept the certificate warning if shown.','ok');setTimeout(()=>{location.href=j.url},700)}else setMsg('siteMsg',j.error||'GPS Sync start failed','bad')}).catch(e=>setMsg('siteMsg','GPS Sync start failed: '+e,'bad'))}"));
   // GPS Sync uses a temporary tab so the working HTTP UI is never replaced
   // by a certificate or secure-to-insecure navigation error page.
   server.sendContent(F("startHttpsTimeLocation=function(){setMsg('siteMsg','Starting GPS Sync HTTPS server...','ok');let ret=location.href,gpsWin=window.open('about:blank','nexstarGpsSync');fetch(cb('/start_https?json=1&return='+enc(ret)),{cache:'no-store'}).then(r=>r.text()).then(t=>{let j=null;try{j=JSON.parse(t)}catch(e){throw new Error('bad GPS Sync response: '+t.slice(0,80))}if(j.ok&&j.url){setMsg('siteMsg','GPS Sync opened in a secure tab. Accept the certificate warning if shown.','ok');setTimeout(()=>{if(gpsWin&&!gpsWin.closed)gpsWin.location.href=j.url;else location.href=j.url},700)}else{if(gpsWin&&!gpsWin.closed)gpsWin.close();setMsg('siteMsg',j.error||'GPS Sync start failed','bad')}}).catch(e=>{if(gpsWin&&!gpsWin.closed)gpsWin.close();setMsg('siteMsg','GPS Sync start failed: '+e,'bad')})};window.addEventListener('message',e=>{let d=e.data;if(!d||d.type!=='nexstar-gps-sync')return;try{if(new URL(e.origin).hostname!==location.hostname)return}catch(x){return}setMsg('siteMsg',d.message||'GPS Sync complete',d.ok?'ok':'bad');if(d.ok)setTimeout(updateNow,500)});saveAp=function(){jsonAction('/setap?ap_ssid='+enc(id('ap_ssid').value)+'&ap_pass='+enc(id('ap_pass').value)+'&ap_ip='+enc(id('ap_ip').value)+'&lx200_port='+enc(id('lx200_port').value)+'&stellarium_port='+enc(id('stellarium_port').value),'apMsg',function(){clearFieldsDirty(['ap_ssid','ap_pass','ap_ip','lx200_port','stellarium_port']);setTimeout(updateNow,500)},'saveAp')};"));
-  server.sendContent(F("function clearSavedSite(){jsonAction('/clearsettings','siteMsg',function(){clearFieldsDirty(['lat','lon','offset','year','month','day','hour','minute','second','poll','idlepoll','handshake','throttle']);setTimeout(updateNow,500)},'clearSavedSite')}function saveWifi(){jsonAction('/setwifi?ssid='+enc(id('wifi_ssid').value)+'&pass='+enc(id('wifi_pass').value),'wifiMsg',function(){clearFieldsDirty(['wifi_ssid','wifi_pass']);setTimeout(updateNow,500)},'saveWifi')}function clearWifi(){jsonAction('/clearwifi','wifiMsg',function(){clearFieldsDirty(['wifi_ssid','wifi_pass']);setTimeout(updateNow,500)},'clearWifi')}function saveAp(){jsonAction('/setap?ap_ssid='+enc(id('ap_ssid').value)+'&ap_pass='+enc(id('ap_pass').value)+'&ap_ip='+enc(id('ap_ip').value)+'&lx200_port='+enc(id('lx200_port').value)+'&stellarium_port='+enc(id('stellarium_port').value),'apMsg',function(){clearFieldsDirty(['wifi_ssid','wifi_pass']);setTimeout(updateNow,500)},'saveAp')}function saveConnCfg(){jsonAction('/setap?ap_ssid='+enc(id('ap_ssid').value)+'&ap_pass='+enc(id('ap_pass').value)+'&ap_ip='+enc(id('ap_ip').value)+'&lx200_port='+enc(id('lx200_port').value)+'&stellarium_port='+enc(id('stellarium_port').value)+'&telnet_port='+enc(id('telnet_port').value)+'&telnet_pass_set=1&telnet_pass='+enc(id('telnet_pass').value)+'&return='+enc(location.href),'connCfgMsg',function(){clearFieldsDirty(['lx200_port','stellarium_port','telnet_port','telnet_pass']);setTimeout(updateNow,500)},'saveConnCfg')}function defaultConnCfg(){jsonAction('/setup_action?name=Connection%20Defaults','connCfgMsg',null,'defaultConnCfg');setVal('web_port',80);setVal('alpaca_port',11111);setVal('alpaca_discovery_port',32227);setVal('lx200_port',4030);setVal('stellarium_port',10001);setVal('telnet_port',23);setVal('telnet_pass','nexstar');setMsg('connCfgMsg','Default server port values loaded. Click Save Server Config to apply.','ok')}function saveNtp(){let en=id('ntp_enable').checked?1:0;jsonAction('/setntp?enabled='+en+'&server1='+enc(id('ntp1').value)+'&server2='+enc(id('ntp2').value)+'&tz='+enc(id('tzrule').value),'ntpMsg',function(){clearFieldsDirty(['ntp_enable','ntp1','ntp2','tzrule']);setTimeout(updateNow,300)},'saveNtp')}function syncNtp(){jsonAction('/syncntp','ntpMsg',null,'syncNtp')}function fetchIpLoc(){jsonAction('/fetch_ip_location','ipLocMsg',function(){setTimeout(updateNow,500)},'fetchIpLoc')}function useIpLoc(){jsonAction('/use_ip_location','ipLocMsg',function(){setTimeout(updateNow,500)},'useIpLoc')}"));
+  server.sendContent(F("function clearSavedSite(){jsonAction('/clearsettings','siteMsg',function(){clearFieldsDirty(['lat','lon','offset','year','month','day','hour','minute','second','poll','idlepoll','handshake','throttle','btwait']);setTimeout(updateNow,500)},'clearSavedSite')}function saveWifi(){jsonAction('/setwifi?ssid='+enc(id('wifi_ssid').value)+'&pass='+enc(id('wifi_pass').value),'wifiMsg',function(){clearFieldsDirty(['wifi_ssid','wifi_pass']);setTimeout(updateNow,500)},'saveWifi')}function clearWifi(){jsonAction('/clearwifi','wifiMsg',function(){clearFieldsDirty(['wifi_ssid','wifi_pass']);setTimeout(updateNow,500)},'clearWifi')}function saveAp(){jsonAction('/setap?ap_ssid='+enc(id('ap_ssid').value)+'&ap_pass='+enc(id('ap_pass').value)+'&ap_ip='+enc(id('ap_ip').value)+'&lx200_port='+enc(id('lx200_port').value)+'&stellarium_port='+enc(id('stellarium_port').value),'apMsg',function(){clearFieldsDirty(['wifi_ssid','wifi_pass']);setTimeout(updateNow,500)},'saveAp')}function saveConnCfg(){jsonAction('/setap?ap_ssid='+enc(id('ap_ssid').value)+'&ap_pass='+enc(id('ap_pass').value)+'&ap_ip='+enc(id('ap_ip').value)+'&lx200_port='+enc(id('lx200_port').value)+'&stellarium_port='+enc(id('stellarium_port').value)+'&telnet_port='+enc(id('telnet_port').value)+'&telnet_pass_set=1&telnet_pass='+enc(id('telnet_pass').value)+'&return='+enc(location.href),'connCfgMsg',function(){clearFieldsDirty(['lx200_port','stellarium_port','telnet_port','telnet_pass']);setTimeout(updateNow,500)},'saveConnCfg')}function defaultConnCfg(){jsonAction('/setup_action?name=Connection%20Defaults','connCfgMsg',null,'defaultConnCfg');setVal('web_port',80);setVal('alpaca_port',11111);setVal('alpaca_discovery_port',32227);setVal('lx200_port',4030);setVal('stellarium_port',10001);setVal('telnet_port',23);setVal('telnet_pass','nexstar');setMsg('connCfgMsg','Default server port values loaded. Click Save Server Config to apply.','ok')}function saveNtp(){let en=id('ntp_enable').checked?1:0;jsonAction('/setntp?enabled='+en+'&server1='+enc(id('ntp1').value)+'&server2='+enc(id('ntp2').value)+'&tz='+enc(id('tzrule').value),'ntpMsg',function(){clearFieldsDirty(['ntp_enable','ntp1','ntp2','tzrule']);setTimeout(updateNow,300)},'saveNtp')}function syncNtp(){jsonAction('/syncntp','ntpMsg',null,'syncNtp')}function fetchIpLoc(){jsonAction('/fetch_ip_location','ipLocMsg',function(){setMsg('ipLocMsg','Lookup queued; waiting for result...','ok');pollIpLoc(0)},'fetchIpLoc')}function pollIpLoc(n){if(n>20)return;setTimeout(async function(){try{let j=await getJson('/status');setText('ipLocStatus',j.approxIpLocationStatus);setText('ipLocLatLon',j.approxIpLocationValid?(Number(j.approxIpLat).toFixed(6)+', '+Number(j.approxIpLon).toFixed(6)):'none');setText('ipLocText',j.approxIpLocationText||'');let s=String(j.approxIpLocationStatus||'');if(s.indexOf('queued')>=0||s.indexOf('progress')>=0){pollIpLoc(n+1)}else{setMsg('ipLocMsg',s,j.approxIpLocationValid?'ok':'bad')}}catch(e){setMsg('ipLocMsg','Lookup status unavailable','bad')}},700)}function useIpLoc(){jsonAction('/use_ip_location','ipLocMsg',function(){setTimeout(updateNow,500)},'useIpLoc')}"));
   server.sendContent(F("const catDSO=[{id:'M1',n:'Crab Nebula',ra:5.57556,dec:22.0145},{id:'M2',n:'Globular Cluster Aquarius',ra:21.5575,dec:-0.8233},{id:'M3',n:'Globular Cluster Canes Venatici',ra:13.7032,dec:28.3773},{id:'M5',n:'Globular Cluster Serpens',ra:15.3092,dec:2.2810},{id:'M8',n:'Lagoon Nebula',ra:18.0602,dec:-24.3867},{id:'M11',n:'Wild Duck Cluster',ra:18.8512,dec:-6.2700},{id:'M13',n:'Hercules Globular Cluster',ra:16.6949,dec:36.4613},{id:'M15',n:'Pegasus Globular Cluster',ra:21.5006,dec:12.2870},{id:'M16',n:'Eagle Nebula',ra:18.3122,dec:-13.8067},{id:'M17',n:'Omega/Swan Nebula',ra:18.3464,dec:-16.1767},{id:'M20',n:'Trifid Nebula',ra:18.0383,dec:-23.0300},{id:'M22',n:'Sagittarius Cluster',ra:18.6067,dec:-23.9047},{id:'M27',n:'Dumbbell Nebula',ra:19.9934,dec:22.7210},{id:'M31',n:'Andromeda Galaxy',ra:0.7123,dec:41.2692},{id:'M32',n:'Andromeda Companion',ra:0.7116,dec:40.8653},{id:'M33',n:'Triangulum Galaxy',ra:1.5641,dec:30.6602},{id:'M35',n:'Gemini Open Cluster',ra:6.1514,dec:24.3333},{id:'M36',n:'Auriga Open Cluster',ra:5.6125,dec:34.1408},{id:'M37',n:'Auriga Open Cluster',ra:5.8717,dec:32.5533},{id:'M38',n:'Auriga Open Cluster',ra:5.4786,dec:35.8550},{id:'M41',n:'Canis Major Open Cluster',ra:6.7667,dec:-20.7567},{id:'M42',n:'Orion Nebula',ra:5.5881,dec:-5.4011},{id:'M43',n:'De Mairan Nebula',ra:5.5933,dec:-5.2778},{id:'M44',n:'Beehive Cluster',ra:8.6665,dec:19.6667},{id:'M45',n:'Pleiades',ra:3.7900,dec:24.1167},{id:'M46',n:'Puppis Open Cluster',ra:7.6962,dec:-14.8100},{id:'M47',n:'Puppis Open Cluster',ra:7.6097,dec:-14.5000},{id:'M51',n:'Whirlpool Galaxy',ra:13.4979,dec:47.1952},{id:'M53',n:'Coma Globular Cluster',ra:13.2154,dec:18.1682},{id:'M57',n:'Ring Nebula',ra:18.8931,dec:33.0292},{id:'M64',n:'Black Eye Galaxy',ra:12.9455,dec:21.6827},{id:'M65',n:'Leo Triplet Galaxy',ra:11.3155,dec:13.0922},{id:'M66',n:'Leo Triplet Galaxy',ra:11.3375,dec:12.9915},{id:'M67',n:'Cancer Open Cluster',ra:8.8500,dec:11.8167},{id:'M78',n:'Orion Reflection Nebula',ra:5.7794,dec:0.0792},{id:'M81',n:'Bode Galaxy',ra:9.9259,dec:69.0653},{id:'M82',n:'Cigar Galaxy',ra:9.9312,dec:69.6797},{id:'M92',n:'Hercules Globular Cluster',ra:17.2854,dec:43.1365},{id:'M97',n:'Owl Nebula',ra:11.2466,dec:55.0190},{id:'M101',n:'Pinwheel Galaxy',ra:14.0535,dec:54.3489},{id:'M104',n:'Sombrero Galaxy',ra:12.6665,dec:-11.6231},{id:'M106',n:'Canes Venatici Galaxy',ra:12.3160,dec:47.3037},{id:'M108',n:'Surfboard Galaxy',ra:11.1919,dec:55.6741},{id:'M109',n:'Barred Spiral Galaxy',ra:11.9598,dec:53.3745},{id:'NGC457',n:'Owl/ET Cluster',ra:1.3208,dec:58.2900},{id:'NGC869',n:'Double Cluster h Persei',ra:2.3167,dec:57.1333},{id:'NGC884',n:'Double Cluster chi Persei',ra:2.3667,dec:57.1500},{id:'NGC7000',n:'North America Nebula',ra:20.9800,dec:44.3333},{id:'NGC6960',n:'Veil Nebula West',ra:20.7600,dec:30.7200},{id:'NGC6992',n:'Veil Nebula East',ra:20.9400,dec:31.7200},{id:'M4',n:'Cat Eye Globular Cluster',ra:16.3931,dec:-26.5258},{id:'M6',n:'Butterfly Cluster',ra:17.6725,dec:-32.2533},{id:'M7',n:'Ptolemy Cluster',ra:17.8975,dec:-34.7928},{id:'M10',n:'Globular Cluster Ophiuchus',ra:16.9525,dec:-4.1003},{id:'M12',n:'Globular Cluster Ophiuchus',ra:16.7873,dec:-1.9485},{id:'M34',n:'Perseus Open Cluster',ra:2.7000,dec:42.7833},{id:'M50',n:'Heart-Shaped Cluster',ra:7.0533,dec:-8.3378},{id:'M52',n:'Cassiopeia Open Cluster',ra:23.4058,dec:61.5933},{id:'M63',n:'Sunflower Galaxy',ra:13.2637,dec:42.0294},{id:'M76',n:'Little Dumbbell Nebula',ra:1.7050,dec:51.5756},{id:'M94',n:'Croc Eye Galaxy',ra:12.8481,dec:41.1203},{id:'M110',n:'Andromeda Companion',ra:0.6728,dec:41.6853},{id:'NGC2237',n:'Rosette Nebula',ra:6.5333,dec:5.0500},{id:'NGC2264',n:'Christmas Tree Cluster/Cone Nebula',ra:6.6833,dec:9.8833},{id:'NGC2392',n:'Eskimo Nebula',ra:7.4852,dec:20.9118},{id:'NGC3242',n:'Ghost of Jupiter',ra:10.4127,dec:-18.6411},{id:'NGC4565',n:'Needle Galaxy',ra:12.6060,dec:25.9877},{id:'NGC4631',n:'Whale Galaxy',ra:12.7042,dec:32.5415},{id:'NGC5907',n:'Splinter Galaxy',ra:15.2745,dec:56.3289},{id:'NGC6826',n:'Blinking Planetary',ra:19.7485,dec:50.5259},{id:'NGC6888',n:'Crescent Nebula',ra:20.2010,dec:38.3550},{id:'IC434',n:'Horsehead Nebula',ra:5.6933,dec:-2.4667},{id:'IC1805',n:'Heart Nebula',ra:2.5500,dec:61.4500},{id:'IC1848',n:'Soul Nebula',ra:2.8500,dec:60.4333}];const catStars=[{id:'Polaris',n:'Polaris',ra:2.5303,dec:89.2641},{id:'Sirius',n:'Sirius',ra:6.7525,dec:-16.7161},{id:'Canopus',n:'Canopus',ra:6.3992,dec:-52.6957},{id:'Arcturus',n:'Arcturus',ra:14.2610,dec:19.1825},{id:'Vega',n:'Vega',ra:18.6156,dec:38.7837},{id:'Capella',n:'Capella',ra:5.2782,dec:45.9980},{id:'Rigel',n:'Rigel',ra:5.2423,dec:-8.2016},{id:'Procyon',n:'Procyon',ra:7.6550,dec:5.2250},{id:'Betelgeuse',n:'Betelgeuse',ra:5.9195,dec:7.4071},{id:'Altair',n:'Altair',ra:19.8464,dec:8.8683},{id:'Aldebaran',n:'Aldebaran',ra:4.5987,dec:16.5093},{id:'Spica',n:'Spica',ra:13.4199,dec:-11.1614},{id:'Antares',n:'Antares',ra:16.4901,dec:-26.4320},{id:'Pollux',n:'Pollux',ra:7.7553,dec:28.0262},{id:'Fomalhaut',n:'Fomalhaut',ra:22.9608,dec:-29.6222},{id:'Deneb',n:'Deneb',ra:20.6905,dec:45.2803},{id:'Regulus',n:'Regulus',ra:10.1395,dec:11.9672},{id:'Castor',n:'Castor',ra:7.5767,dec:31.8883},{id:'Bellatrix',n:'Bellatrix',ra:5.4289,dec:6.3497},{id:'Elnath',n:'Elnath',ra:5.4582,dec:28.6075},{id:'Alnitak',n:'Alnitak',ra:5.6793,dec:-1.9426},{id:'Alnilam',n:'Alnilam',ra:5.6136,dec:-1.2019},{id:'Mintaka',n:'Mintaka',ra:5.5334,dec:-0.2991},{id:'Dubhe',n:'Dubhe',ra:11.0621,dec:61.7510},{id:'Mizar',n:'Mizar',ra:13.3988,dec:54.9254},{id:'Achernar',n:'Achernar',ra:1.6286,dec:-57.2368},{id:'Hadar',n:'Beta Centauri',ra:14.0637,dec:-60.3730},{id:'Acrux',n:'Alpha Crucis',ra:12.4433,dec:-63.0991},{id:'Gacrux',n:'Gamma Crucis',ra:12.5194,dec:-57.1132},{id:'Menkent',n:'Theta Centauri',ra:14.1114,dec:-36.3700},{id:'Rasalhague',n:'Alpha Ophiuchi',ra:17.5822,dec:12.5600},{id:'Kochab',n:'Beta Ursae Minoris',ra:14.8451,dec:74.1555},{id:'Alkaid',n:'Eta Ursae Majoris',ra:13.7923,dec:49.3133},{id:'Alioth',n:'Epsilon Ursae Majoris',ra:12.9005,dec:55.9598},{id:'Alcor',n:'Alcor',ra:13.4204,dec:54.9879},{id:'Alphecca',n:'Alpha Coronae Borealis',ra:15.5781,dec:26.7147},{id:'Rasalgethi',n:'Alpha Herculis',ra:17.2441,dec:14.3903},{id:'Enif',n:'Epsilon Pegasi',ra:21.7364,dec:9.8750},{id:'Scheat',n:'Beta Pegasi',ra:23.0629,dec:28.0828},{id:'Markab',n:'Alpha Pegasi',ra:23.0793,dec:15.2053},{id:'Mirach',n:'Beta Andromedae',ra:1.1622,dec:35.6206},{id:'Almach',n:'Gamma Andromedae',ra:2.0649,dec:42.3297},{id:'Hamal',n:'Alpha Arietis',ra:2.1195,dec:23.4624},{id:'Mirfak',n:'Alpha Persei',ra:3.4054,dec:49.8612},{id:'Algol',n:'Beta Persei',ra:3.1361,dec:40.9556}];const catSolar=['Sun','Moon','Mercury','Venus','Mars','Jupiter','Saturn','Uranus','Neptune'];const catExtraCompact=`NGC869|Double Cluster h Persei|23300|571330|open^NGC884|Double Cluster chi Persei|23667|571500|open^NGC457|Owl Cluster|13167|582830|open^NGC663|Cassiopeia Open Cluster|17667|612170|open^NGC752|Andromeda Open Cluster|19583|377830|open^NGC7789|Caroline Rose Cluster|239583|567170|open^NGC7000|North America Nebula|209667|443330|nebula^IC5070|Pelican Nebula|208333|443670|nebula^NGC6960|Western Veil Nebula|207667|307000|nebula^NGC6992|Eastern Veil Nebula|209333|317170|nebula^NGC7635|Bubble Nebula|233333|612000|nebula^NGC281|Pacman Nebula|8833|566330|nebula^NGC1499|California Nebula|40000|366330|nebula^NGC2024|Flame Nebula|57000|-18500|nebula^NGC1977|Running Man Nebula|55917|-48500|nebula^NGC2174|Monkey Head Nebula|61500|206500|nebula^NGC2359|Thor's Helmet|73167|-132170|nebula^NGC3372|Carina Nebula|107500|-598670|nebula^NGC3603|Southern Nebula Cluster|112500|-612670|nebula^NGC6188|Fighting Dragons Nebula|166667|-487670|nebula^NGC6334|Cat's Paw Nebula|173333|-361170|nebula^NGC6357|Lobster Nebula|174000|-342000|nebula^M6|Butterfly Cluster|176683|-322170|open^M7|Ptolemy Cluster|178975|-348170|open^M10|Globular Cluster Ophiuchus|169517|-41000|globular^M12|Globular Cluster Ophiuchus|167875|-19500|globular^M14|Globular Cluster Ophiuchus|176267|-32450|globular^M19|Globular Cluster Ophiuchus|170438|-262670|globular^M21|Sagittarius Open Cluster|180700|-225000|open^M23|Sagittarius Open Cluster|179500|-190170|open^M24|Sagittarius Star Cloud|182667|-184830|open^M25|Sagittarius Open Cluster|185300|-191170|open^M26|Scutum Open Cluster|187517|-93830|open^M28|Globular Cluster Sagittarius|184100|-248670|globular^M29|Cygnus Open Cluster|203983|385330|open^M30|Globular Cluster Capricornus|216728|-231800|globular^M34|Perseus Open Cluster|27000|427830|open^M39|Cygnus Open Cluster|215333|484330|open^M40|Winnecke 4 Double Star|123700|580830|star^M48|Hydra Open Cluster|82283|-57500|open^M50|Monoceros Open Cluster|70500|-83330|open^M52|Cassiopeia Open Cluster|234000|616000|open^M54|Globular Cluster Sagittarius|189175|-304830|globular^M55|Globular Cluster Sagittarius|196667|-309670|globular^M56|Globular Cluster Lyra|192767|301830|globular^M69|Globular Cluster Sagittarius|185231|-323480|globular^M70|Globular Cluster Sagittarius|187202|-322930|globular^M71|Sagitta Globular Cluster|198960|187790|globular^M72|Globular Cluster Aquarius|208910|-125370|globular^M73|Aquarius Asterism|209833|-126330|open^M75|Globular Cluster Sagittarius|201013|-219220|globular^M79|Globular Cluster Lepus|54029|-245240|globular^M80|Globular Cluster Scorpius|162830|-229760|globular^M107|Globular Cluster Ophiuchus|165422|-130540|globular^M108|Surfboard Galaxy|111919|556740|galaxy^M109|Barred Spiral Galaxy|119599|533750|galaxy^NGC253|Sculptor Galaxy|7925|-252880|galaxy^NGC288|Sculptor Globular Cluster|8783|-265830|globular^NGC891|Edge-on Galaxy Andromeda|23758|423500|galaxy^NGC1023|Perseus Lenticular Galaxy|26767|390630|galaxy^NGC1232|Eridanus Spiral Galaxy|31620|-205790|galaxy^NGC1300|Barred Spiral Galaxy|33319|-194110|galaxy^NGC1316|Fornax A Galaxy|33783|-372080|galaxy^NGC1365|Great Barred Spiral Galaxy|35600|-361400|galaxy^NGC2403|Camelopardalis Galaxy|76150|656020|galaxy^NGC2683|UFO Galaxy|88775|334210|galaxy^NGC2903|Leo Galaxy|95333|215000|galaxy^NGC3115|Spindle Galaxy|100872|-77180|galaxy^NGC3521|Bubble Galaxy|110950|-350|galaxy^NGC3628|Hamburger Galaxy|113380|135890|galaxy^NGC4038|Antennae Galaxies|120314|-188670|galaxy^NGC4244|Silver Needle Galaxy|122939|378070|galaxy^NGC4449|Canes Venatici Galaxy|124698|440940|galaxy^NGC4725|One-armed Spiral Galaxy|128400|255010|galaxy^NGC5128|Centaurus A|134240|-430190|galaxy^NGC5139|Omega Centauri|134467|-474790|globular^NGC5195|M51 Companion|134990|472660|galaxy^NGC5236|Southern Pinwheel M83|136167|-298660|galaxy^NGC5986|Lupus Globular Cluster|157700|-377860|globular^NGC6144|Scorpius Globular Cluster|164500|-260230|globular^NGC6231|Northern Jewel Box|169000|-418000|open^NGC6543|Cat's Eye Nebula|179710|666330|planetary_nebula^NGC6572|Blue Racquetball Nebula|182010|68530|planetary_nebula^NGC6720|Ring Nebula M57|188931|330290|planetary_nebula^NGC6752|Pavo Globular Cluster|191767|-599840|globular^NGC7662|Blue Snowball Nebula|234310|425350|planetary_nebula^IC342|Hidden Galaxy|37800|680960|galaxy^IC1396|Elephant Trunk Nebula|216500|575000|nebula^IC5146|Cocoon Nebula|218917|472670|nebula^B33|Horsehead Dark Nebula|56833|-24670|nebula^Barnard33|Horsehead Nebula|56833|-24670|nebula^Caldwell14|Double Cluster|23500|571330|open^Caldwell20|North America Nebula|209667|443330|nebula^Caldwell33|Eastern Veil Nebula|209333|317170|nebula^Caldwell34|Western Veil Nebula|207667|307000|nebula^Caldwell49|Rosette Nebula|65333|50500|nebula^Caldwell63|Helix Nebula|224939|-208370|planetary_nebula^Caldwell76|Centaurus A|134240|-430190|galaxy^Caldwell80|Omega Centauri|134467|-474790|globular^Caldwell92|Carina Nebula|107500|-598670|nebula^Caldwell93|Jewel Box Cluster|128833|-603670|open`;function catDecodeExtra(s){return s.split('^').filter(Boolean).map(r=>{let p=r.split('|');return{id:p[0],n:p[1],ra:Number(p[2])/10000,dec:Number(p[3])/10000,k:p[4]||'other'}})}const catExtra=catDecodeExtra(catExtraCompact);/* BSC5_GENERATED_BEGIN */const catBSC=[];let catBSCLoaded=false,catBSCLoading=false;function catBscCount(){return catBSC.length}function catDecodeBscText(s){return s.split('^').filter(Boolean).map(r=>{let p=r.split('|');let hr=p[0],m=Number(p[4])/100;return{id:'HR'+hr,n:(p[1]||('HR'+hr))+' mag '+m.toFixed(2),ra:Number(p[2])/10000,dec:Number(p[3])/10000,mag:m,k:'star'}})}async function loadBSC5(){if(catBSCLoaded)return true;if(catBSCLoading)return false;catBSCLoading=true;setText('bscCount','loading...');try{let t=await getText('/bsc5_data');let a=catDecodeBscText(t);catBSC.splice(0,catBSC.length,...a);catBSCLoaded=true;setText('bscCount',String(catBSC.length));return true}catch(e){setText('bscCount','load failed');return false}finally{catBSCLoading=false}}/* BSC5_GENERATED_END */function catBscCount(){return typeof catBSC!=='undefined'?catBSC.length:0}function degNorm(x){x=x%360;if(x<0)x+=360;return x}function rad(d){return d*Math.PI/180}function deg(r){return r*180/Math.PI}function jdNow(){let d=new Date();return d.getTime()/86400000+2440587.5}function sunRaDec(){let jd=jdNow(),n=jd-2451545.0,L=degNorm(280.460+0.9856474*n),g=degNorm(357.528+0.9856003*n),lam=degNorm(L+1.915*Math.sin(rad(g))+0.020*Math.sin(rad(2*g))),eps=23.439-0.0000004*n;let ra=deg(Math.atan2(Math.cos(rad(eps))*Math.sin(rad(lam)),Math.cos(rad(lam))))/15;if(ra<0)ra+=24;let dec=deg(Math.asin(Math.sin(rad(eps))*Math.sin(rad(lam))));return{ra:ra,dec:dec,n:'Sun',id:'Sun',approx:true}}function moonRaDec(){let jd=jdNow(),d=jd-2451543.5,N=degNorm(125.1228-0.0529538083*d),i=5.1454,w=degNorm(318.0634+0.1643573223*d),a=60.2666,e=0.054900,M=degNorm(115.3654+13.0649929509*d);let E=rad(M)+e*Math.sin(rad(M))*(1+e*Math.cos(rad(M)));let xv=a*(Math.cos(E)-e),yv=a*(Math.sqrt(1-e*e)*Math.sin(E));let v=deg(Math.atan2(yv,xv)),r=Math.sqrt(xv*xv+yv*yv);let xh=r*(Math.cos(rad(N))*Math.cos(rad(v+w))-Math.sin(rad(N))*Math.sin(rad(v+w))*Math.cos(rad(i)));let yh=r*(Math.sin(rad(N))*Math.cos(rad(v+w))+Math.cos(rad(N))*Math.sin(rad(v+w))*Math.cos(rad(i)));let zh=r*(Math.sin(rad(v+w))*Math.sin(rad(i)));let lon=degNorm(deg(Math.atan2(yh,xh))),lat=deg(Math.atan2(zh,Math.sqrt(xh*xh+yh*yh)));let n=jd-2451545.0,eps=23.439-0.0000004*n;let xe=Math.cos(rad(lon))*Math.cos(rad(lat));let ye=Math.sin(rad(lon))*Math.cos(rad(lat))*Math.cos(rad(eps))-Math.sin(rad(lat))*Math.sin(rad(eps));let ze=Math.sin(rad(lon))*Math.cos(rad(lat))*Math.sin(rad(eps))+Math.sin(rad(lat))*Math.cos(rad(eps));let ra=deg(Math.atan2(ye,xe))/15;if(ra<0)ra+=24;let dec=deg(Math.atan2(ze,Math.sqrt(xe*xe+ye*ye)));return{ra:ra,dec:dec,n:'Moon',id:'Moon',approx:true}}function simpleSolar(name){if(name==='Sun')return sunRaDec();if(name==='Moon')return moonRaDec();let base={Mercury:[4.092,252.3,7],Venus:[1.602,181.9,3.4],Mars:[0.524,355.4,1.85],Jupiter:[0.0831,34.4,1.3],Saturn:[0.0335,50.1,2.5],Uranus:[0.0117,314.0,0.8],Neptune:[0.006,304.0,1.8]};let b=base[name];if(!b)return null;let jd=jdNow(),n=jd-2451545.0,lon=degNorm(b[1]+b[0]*n),eps=23.439-0.0000004*n;let ra=deg(Math.atan2(Math.cos(rad(eps))*Math.sin(rad(lon)),Math.cos(rad(lon))))/15;if(ra<0)ra+=24;let dec=deg(Math.asin(Math.sin(rad(eps))*Math.sin(rad(lon))));return{ra:ra,dec:dec,n:name,id:name,approx:true}}function catKind(o){if(o&&o.k)return o.k;let n=((o.n||'')+' '+(o.id||'')).toLowerCase();if(n.includes('globular'))return'globular';if(n.includes('open cluster')||n.includes('cluster'))return'open';if(n.includes('planetary')||n.includes('dumbbell')||n.includes('ring nebula')||n.includes('eskimo')||n.includes('ghost of jupiter')||n.includes('blinking'))return'planetary_nebula';if(n.includes('galaxy')||n.includes('andromeda')||n.includes('whirlpool')||n.includes('sombrero')||n.includes('pinwheel')||n.includes('needle')||n.includes('whale'))return'galaxy';if(n.includes('nebula')||n.includes('horsehead')||n.includes('rosette')||n.includes('heart')||n.includes('soul')||n.includes('veil'))return'nebula';return'other'}function catAllRows(){let a=[];catSolar.forEach(x=>a.push({id:x,n:x,src:'solar'}));catDSO.forEach(x=>a.push(Object.assign({src:'dso'},x)));catExtra.forEach(x=>a.push(Object.assign({src:'extra'},x)));catStars.forEach(x=>a.push(Object.assign({src:'star'},x)));catBSC.forEach(x=>a.push(Object.assign({src:'bsc'},x)));return a}function mountRaDecNow(){if(!lastStatus||!lastStatus.cacheValid)return null;let raH=Number(lastStatus.raHours),dec=Number(lastStatus.decDeg);if(!isFinite(raH)||!isFinite(dec))return null;return{raH:((raH%24)+24)%24,dec:dec}}function catAngularDistanceDeg(x){let m=mountRaDecNow();if(!m||!x||!isFinite(x.ra)||!isFinite(x.dec))return 9999;let ra1=m.raH*Math.PI/12,ra2=Number(x.ra)*Math.PI/12,d1=m.dec*Math.PI/180,d2=Number(x.dec)*Math.PI/180;let c=Math.sin(d1)*Math.sin(d2)+Math.cos(d1)*Math.cos(d2)*Math.cos(ra1-ra2);return Math.acos(Math.max(-1,Math.min(1,c)))*180/Math.PI}function catIdentifyPool(){let a=catSolar.map(x=>simpleSolar(x)).filter(x=>x&&isFinite(x.ra)&&isFinite(x.dec)).map(x=>Object.assign({src:'solar'},x)).concat(catDSO.map(x=>Object.assign({src:'dso'},x))).concat(catExtra.map(x=>Object.assign({src:'extra'},x))).concat(catStars.map(x=>Object.assign({src:'star'},x)));if(catBSCLoaded)a=a.concat(catBSC.map(x=>Object.assign({src:'bsc'},x)));return a}let lastPointingIdKey='';function autoUpdatePointingId(){if(!lastStatus||!lastStatus.cacheValid)return;let k=Number(lastStatus.raHours).toFixed(4)+','+Number(lastStatus.decDeg).toFixed(3);if(k===lastPointingIdKey)return;lastPointingIdKey=k;if(typeof identifyPointingNow==='function')identifyPointingNow()}function sameCatalogObject(a,b){if(!a||!b)return false;return (a.src||'dso')===(b.src||'dso')&&a.id===b.id}function catalogShortLabel(x){return x?x.id+(x.n&&x.n!==x.id?' - '+x.n:''):'?'}function identifyPointingNow(){let m=mountRaDecNow(),e=id('nearestInfo'),box=id('pointingIdBox'),s=id('nearestSelect');if(s)s.innerHTML='';let nc=id('nearCount');if(nc)nc.textContent='0';if(!m){if(box)box.value='waiting for valid mount RA/Dec cache';if(e)e.innerHTML='Pointing ID: waiting for valid mount RA/Dec cache';return}if(!catBSCLoaded&&!catBSCLoading){loadBSC5().then(()=>{lastPointingIdKey='';identifyPointingNow();catPopulate()})}let a=catIdentifyPool().map(x=>Object.assign({},x,{dist:catAngularDistanceDeg(x)})).filter(x=>isFinite(x.dist)&&x.dist<9999).sort((x,y)=>x.dist-y.dist);let best=a[0];if(!best){if(box)box.value='no catalog match yet';if(e)e.innerHTML='Pointing ID: no catalog match yet';return}if(box)box.value=catOptionText(best);let nr=id('nearRadius'),rad=nr?Number(nr.value):10;if(!isFinite(rad)||rad<=0)rad=10;let near=a.filter(x=>!sameCatalogObject(x,best)&&isFinite(x.dist)&&x.dist<=rad);if(s){let nc=id('nearCount');if(nc)nc.textContent=String(near.length);let ph=document.createElement('option');ph.value='';ph.textContent=near.length?'Select a nearby object':'No nearby objects inside radius';ph.selected=true;s.appendChild(ph);near.forEach((x,i)=>{let op=document.createElement('option');op.value=(x.src||'dso')+':'+x.id;op.textContent=(i===0?'BEST: ':'')+catNearestOptionText(x);s.appendChild(op)})}if(e)e.innerHTML='<b>Pointing ID:</b> '+catalogShortLabel(best)+'<br><b>Mount RA/Dec used:</b> '+m.raH.toFixed(6)+' h / '+m.dec.toFixed(6)+' deg<br><b>Distance:</b> '+best.dist.toFixed(2)+' deg'}function catSortAndLimit(a){let sm=id('cat_sort'),sort=sm?sm.value:'brightness';if(sort==='name')a.sort((x,y)=>(x.n||x.id||'').localeCompare(y.n||y.id||''));else if(sort==='visibility')a.sort((x,y)=>{let ax=catAltAzFromRaDec(x.ra,x.dec),ay=catAltAzFromRaDec(y.ra,y.dec);let va=((ax&&isFinite(ax.alt))?ax.alt:-999),vb=((ay&&isFinite(ay.alt))?ay.alt:-999);return vb-va});else a.sort((x,y)=>(isFinite(x.mag)?x.mag:99)-(isFinite(y.mag)?y.mag:99));window.catTotalBeforeLimit=a.length;return a}function catBaseArrayForGroup(v){let a=[];if(v==='solar')a=catSolar.map(x=>({id:x,n:x,src:'solar'}));else if(v==='stars')a=catStars.map(x=>Object.assign({src:'star'},x));else if(v==='bsc'){if(!catBSCLoaded&&!catBSCLoading)loadBSC5().then(()=>{identifyPointingNow();catPopulate()});a=catBSC.map(x=>Object.assign({src:'bsc'},x));}else{a=catDSO.map(x=>Object.assign({src:'dso'},x)).concat(catExtra.map(x=>Object.assign({src:'extra'},x)));if(v==='galaxy'||v==='nebula'||v==='planetary_nebula'||v==='globular'||v==='open')a=a.filter(x=>catKind(x)===v);}return a}function catArray(){let g=id('cat_group'),v=g?g.value:'messier',q=(id('cat_search')?id('cat_search').value:'').toLowerCase();let a=[];if(q){a=catAllRows().filter(x=>(x.id+' '+(x.n||'')).toLowerCase().includes(q));}else a=catBaseArrayForGroup(v);return catSortAndLimit(a)}window.catVisibleOnly=false;function catVisibleNow(c){let aa=catAltAzFromRaDec(c.ra,c.dec);if(!aa||aa.alt<0)return false;if(!lastStatus||!lastStatus.siteValid||!lastStatus.timeValid)return false;let lat=Number(lastStatus.latitude)*Math.PI/180,dec=Number(c.dec)*Math.PI/180,cLat=Math.cos(lat),cDec=Math.cos(dec);if(!isFinite(lat)||!isFinite(dec)||Math.abs(cLat)<1e-6||Math.abs(cDec)<1e-6)return false;let cosH=(0-Math.sin(lat)*Math.sin(dec))/(cLat*cDec);if(cosH<-1)return true;if(cosH>1)return false;let H=Math.acos(Math.max(-1,Math.min(1,cosH)))*12/Math.PI,lst=lstHours();if(!isFinite(lst))return false;let hoursUntilSet=(((Number(c.ra)+H-lst)%24)+24)%24/1.00273790935;return hoursUntilSet>0.02}function catToggleVisible(){}function localTzAbbr(){if(!lastStatus)return'';let off=Number(lastStatus.utcOffsetMinutes);if(!isFinite(off))return'';if(off===-420)return'MST';if(off===-360)return'MDT';let sg=off>=0?'+':'-',a=Math.abs(off),h=Math.floor(a/60),m=a%60;return'UTC'+sg+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')}function eventBaseMs(dayOff){if(!lastStatus)return NaN;let off=Number(lastStatus.utcOffsetMinutes)||0;return Date.UTC(Number(lastStatus.localYear),Number(lastStatus.localMonth)-1,Number(lastStatus.localDay)+dayOff)-off*60000}function eventFmt(ms,base){let off=Number(lastStatus.utcOffsetMinutes)||0,d=new Date(ms+off*60000),b=new Date(base+off*60000),h=d.getUTCHours(),m=d.getUTCMinutes(),ap=h>=12?'PM':'AM',hh=h%12;if(!hh)hh=12;let suf=d.getUTCDate()!==b.getUTCDate()?' +1':'';return hh+':'+String(m).padStart(2,'0')+' '+ap+suf}function sunMoonEvents(kind){if(!lastStatus||!lastStatus.siteValid||!lastStatus.timeValid)return null;let lat=Number(lastStatus.latitude),lon=Number(lastStatus.longitude);if(!isFinite(lat)||!isFinite(lon))return null;let r=Math.PI/180,dayMs=864e5,J1970=2440588,J2000=2451545,toJ=t=>t/dayMs-0.5+J1970,fromJ=j=>(j+0.5-J1970)*dayMs,toD=t=>toJ(t)-J2000,lw=-lon*r,phi=lat*r,ob=23.4397*r;function ra(l,b){return Math.atan2(Math.sin(l)*Math.cos(ob)-Math.tan(b)*Math.sin(ob),Math.cos(l))}function dec(l,b){return Math.asin(Math.sin(b)*Math.cos(ob)+Math.cos(b)*Math.sin(ob)*Math.sin(l))}function sid(d){return r*(280.16+360.9856235*d)-lw}function alt(H,d){return Math.asin(Math.sin(phi)*Math.sin(d)+Math.cos(phi)*Math.cos(d)*Math.cos(H))}function refr(h){if(h<0)h=0;return 0.0002967/Math.tan(h+0.00312536/(h+0.08901179))}function sunC(d){let M=r*(357.5291+0.98560028*d),C=r*(1.9148*Math.sin(M)+0.02*Math.sin(2*M)+0.0003*Math.sin(3*M)),P=r*102.9372,L=M+C+P+Math.PI;return{M:M,L:L,dec:dec(L,0),ra:ra(L,0)}}function moonC(d){let L=r*(218.316+13.176396*d),M=r*(134.963+13.064993*d),F=r*(93.272+13.22935*d),l=L+r*6.289*Math.sin(M),b=r*5.128*Math.sin(F);return{ra:ra(l,b),dec:dec(l,b)}}function moonAlt(t){let d=toD(t),c=moonC(d),h=alt(sid(d)-c.ra,c.dec);return h+refr(h)}function solar(base){let d=toD(base),n=Math.round(d-0.0009-lw/(2*Math.PI)),ds=0.0009+lw/(2*Math.PI)+n,c=sunC(ds),Jnoon=J2000+ds+0.0053*Math.sin(c.M)-0.0069*Math.sin(2*c.L),w=Math.acos((Math.sin(-0.833*r)-Math.sin(phi)*Math.sin(c.dec))/(Math.cos(phi)*Math.cos(c.dec))),a=w/(2*Math.PI),Jset=J2000+ds+a+0.0053*Math.sin(c.M)-0.0069*Math.sin(2*c.L),Jrise=Jnoon-(Jset-Jnoon);return{rise:fromJ(Jrise),set:fromJ(Jset)}}function moonDay(base){let hc=0.133*r,h0=moonAlt(base)-hc,rise=null,set=null;for(let i=1;i<=24;i+=2){let h1=moonAlt(base+i*3600e3)-hc,h2=moonAlt(base+(i+1)*3600e3)-hc,a=(h0+h2)/2-h1,b=(h2-h0)/2,xe=-b/(2*a),ye=(a*xe+b)*xe+h1,D=b*b-4*a*h1,n=0,x1=0,x2=0;if(D>=0){let dx=Math.sqrt(D)/(Math.abs(a)*2);x1=xe-dx;x2=xe+dx;if(Math.abs(x1)<=1)n++;if(Math.abs(x2)<=1)n++;if(x1<-1)x1=x2}if(n===1){if(h0<0)rise=base+(i+x1)*3600e3;else set=base+(i+x1)*3600e3}else if(n===2){rise=base+(i+(ye<0?x2:x1))*3600e3;set=base+(i+(ye<0?x1:x2))*3600e3}if(rise&&set)break;h0=h2}return{rise:rise,set:set}}let base=eventBaseMs(0);if(kind==='Sun'){let e=solar(base);return{short:'R '+eventFmt(e.rise,base)+' S '+eventFmt(e.set,base),detail:'Rise/Set: sunrise '+eventFmt(e.rise,base)+' / sunset '+eventFmt(e.set,base)}}if(kind==='Moon'){let e=moonDay(base);if(!e.rise)e.rise=moonDay(eventBaseMs(1)).rise;if(!e.set)e.set=moonDay(eventBaseMs(1)).set;return{short:'R '+(e.rise?eventFmt(e.rise,base):'none')+' S '+(e.set?eventFmt(e.set,base):'none'),detail:'Rise/Set: moonrise '+(e.rise?eventFmt(e.rise,base):'none')+' / moonset '+(e.set?eventFmt(e.set,base):'none')}}return null}function catRiseSet(c,decArg){if(!lastStatus||!lastStatus.siteValid||!lastStatus.timeValid)return null;if(c&&typeof c==='object'&&(c.id==='Sun'||c.id==='Moon'))return sunMoonEvents(c.id);let raHours=typeof c==='object'?c.ra:c,decDeg=typeof c==='object'?c.dec:decArg;let tz=localTzAbbr(),z=tz?' '+tz:'',lat=Number(lastStatus.latitude)*Math.PI/180,dec=Number(decDeg)*Math.PI/180,cLat=Math.cos(lat),cDec=Math.cos(dec);if(!isFinite(lat)||!isFinite(dec)||Math.abs(cLat)<1e-6||Math.abs(cDec)<1e-6)return null;let cosH=(0-Math.sin(lat)*Math.sin(dec))/(cLat*cDec);if(cosH>1)return{short:'never rises',detail:'Rise/Set: never rises at current site'};if(cosH<-1)return{short:'circumpolar',detail:'Rise/Set: circumpolar at current site'};let H=Math.acos(Math.max(-1,Math.min(1,cosH)))*12/Math.PI,lst=lstHours();if(!isFinite(lst))return null;function p(n){return String(n).padStart(2,'0')}function at(targetLst){let dh=(((targetLst-lst)%24)+24)%24/1.00273790935,now=Number(lastStatus.localHour)*3600+Number(lastStatus.localMinute)*60+Number(lastStatus.localSecond),sec=Math.round((now+dh*3600)%86400);if(sec<0)sec+=86400;return p(Math.floor(sec/3600))+':'+p(Math.floor((sec%3600)/60))}let rr=at(Number(raHours)-H),ss=at(Number(raHours)+H);return{short:'R '+rr+z+' S '+ss+z,detail:'Rise/Set: next rise '+rr+z+' / next set '+ss+z}}function catAltAzShort(c){let aa=c?catAltAzFromRaDec(c.ra,c.dec):null;if(aa&&isFinite(aa.alt)&&isFinite(aa.az))return'Alt '+Number(aa.alt).toFixed(1)+' Az '+Number(aa.az).toFixed(1);return'Alt ? Az ?'}function catOptionText(x){let c=x.src==='solar'?simpleSolar(x.id):x;let t=x.id+(x.n&&x.n!==x.id?' - '+x.n:'');if(c)t+=' | '+catAltAzShort(c);let rs=c?catRiseSet(c):null;if(rs)t+=' | '+rs.short;return t}function catNearestOptionText(x){let t=catOptionText(x);if(isFinite(x.dist)&&x.dist<9999)t+=' | '+x.dist.toFixed(2)+' deg away';return t}function catRefreshLabels(){let o=id('cat_obj');if(!o)return;let arr=catArray(),m={};arr.forEach(x=>{m[(x.src||'dso')+':'+x.id]=catOptionText(x)});for(let i=0;i<o.options.length;i++){let v=o.options[i].value;if(m[v])o.options[i].textContent=m[v]}}function catPopulate(){setText('bscCount',String(catBscCount()));let o=id('cat_obj');if(!o)return;let arr=catArray();let old=o.value;o.innerHTML='';arr.forEach(x=>{let op=document.createElement('option');let c=x.src==='solar'?simpleSolar(x.id):x,aa=c?catAltAzFromRaDec(c.ra,c.dec):null;op.value=(x.src||'dso')+':'+x.id;op.textContent=catOptionText(x);if(aa&&isFinite(aa.alt)&&aa.alt<0){op.style.color='#777';op.style.backgroundColor='#222'}o.appendChild(op)});setText('catShown',String(arr.length));setText('catTotal',String(window.catTotalBeforeLimit||arr.length));if(old){for(let i=0;i<o.options.length;i++){if(o.options[i].value===old){o.selectedIndex=i;break}}}if(o.selectedIndex<0&&o.options.length>0)o.selectedIndex=0;catUpdate()}function catSelected(){let o=id('cat_obj');if(!o||!o.value)return null;let p=o.value.split(':'),src=p[0],v=p.slice(1).join(':');if(src==='solar')return simpleSolar(v);if(src==='star')return catStars.find(x=>x.id===v);if(src==='bsc')return catBSC.find(x=>x.id===v);if(src==='extra')return catExtra.find(x=>x.id===v);return catDSO.find(x=>x.id===v)}function catSetInfo(s){let e=document.getElementById('cat_info');if(!e)return;e.innerHTML=s}function hms(ra){ra=((Number(ra)%24)+24)%24;let h=Math.floor(ra),m=Math.floor((ra-h)*60),s=(((ra-h)*60-m)*60);return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+s.toFixed(1).padStart(4,'0')}function dms(dec){let d0=Number(dec),sg=d0<0?'-':'+';d0=Math.abs(d0);let d=Math.floor(d0),m=Math.floor((d0-d)*60),s=(((d0-d)*60-m)*60);return sg+String(d).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+s.toFixed(0).padStart(2,'0')}function catAltAzFromRaDec(raHours,decDeg){if(!lastStatus)return null;let lat=Number(lastStatus.latitude),lon=Number(lastStatus.longitude),yr=Number(lastStatus.localYear),mo=Number(lastStatus.localMonth),dy=Number(lastStatus.localDay),hr=Number(lastStatus.localHour),mi=Number(lastStatus.localMinute),se=Number(lastStatus.localSecond);if(!isFinite(lat)||!isFinite(lon)||!isFinite(yr)||!isFinite(mo)||!isFinite(dy)||!isFinite(hr)||!isFinite(mi)||!isFinite(se))return null;function d2r(d){return d*Math.PI/180}function r2d(r){return r*180/Math.PI}let off=Number(lastStatus.utcOffsetMinutes||0),utcMs=Date.UTC(yr,mo-1,dy,hr,mi,se)-off*60000,jd=utcMs/86400000+2440587.5,T=(jd-2451545.0)/36525.0,gmst=280.46061837+360.98564736629*(jd-2451545.0)+0.000387933*T*T-(T*T*T)/38710000.0;gmst=((gmst%360)+360)%360;let lst=((gmst+lon)%360+360)%360,raDeg=((Number(raHours)*15)%360+360)%360,ha=((lst-raDeg)%360+360)%360;if(ha>180)ha-=360;let haR=d2r(ha),decR=d2r(Number(decDeg)),latR=d2r(lat),sinAlt=Math.sin(decR)*Math.sin(latR)+Math.cos(decR)*Math.cos(latR)*Math.cos(haR);sinAlt=Math.max(-1,Math.min(1,sinAlt));let alt=r2d(Math.asin(sinAlt)),cosAz=(Math.sin(decR)-Math.sin(d2r(alt))*Math.sin(latR))/(Math.cos(d2r(alt))*Math.cos(latR));cosAz=Math.max(-1,Math.min(1,cosAz));let az=r2d(Math.acos(cosAz));if(Math.sin(haR)>0)az=360-az;az=((az%360)+360)%360;return{alt:alt,az:az}}function catUpdate(){let c=catSelected();if(!c){catSetInfo('RA ? / Dec ?<br>Sky Alt ? / Az ?<br>Mount Alt ? / Az ?');return}let aa=catAltAzFromRaDec(c.ra,c.dec);let coord='RA '+hms(c.ra)+' h / Dec '+dms(c.dec)+' deg<br>Sky Alt '+(aa?Number(aa.alt).toFixed(2):'?')+' deg / Az '+(aa?Number(aa.az).toFixed(2):'?')+' deg';coord+='<br>Mount Alt '+(lastStatus&&lastStatus.altAzCacheValid?Number(lastStatus.altDeg).toFixed(2):'?')+' deg / Az '+(lastStatus&&lastStatus.altAzCacheValid?Number(lastStatus.azDeg).toFixed(2):'?')+' deg';if(c.approx)coord+=' APPROX ephemeris';catSetInfo(coord)}function groupForCatalogItem(c){let src=c?(c.src||'dso'):'dso';if(src==='bsc')return'bsc';if(src==='star')return'stars';if(src==='solar')return'solar';let k=catKind(c);if(k==='galaxy'||k==='nebula'||k==='planetary_nebula'||k==='globular'||k==='open')return k;return'messier'}function forceObjectPulldownTo(c){if(!c)return false;let o=id('cat_obj');if(!o)return false;let val=(c.src||'dso')+':'+c.id;for(let i=0;i<o.options.length;i++){if(o.options[i].value===val){o.selectedIndex=i;catUpdate();return true}}return false}function selectNearestCandidate(){let s=id('nearestSelect');if(!s||!s.value)return;let p=s.value.split(':'),src=p[0],objId=p.slice(1).join(':'),a=catIdentifyPool();let c=a.find(x=>(x.src||'dso')===src&&x.id===objId);if(!c)return;let g=id('cat_group');if(g){let gv=groupForCatalogItem(c);if(g.value!==gv)g.value=gv}let search=id('cat_search');if(search)search.value='';catPopulate();if(!forceObjectPulldownTo(c)){let search2=id('cat_search');if(search2)search2.value=c.id;catPopulate();forceObjectPulldownTo(c)}}function setRaDecRaw(ra,dec){let r=document.getElementById('ra_hours'),d=document.getElementById('dec_deg');gotoRaDecDirty=false;if(r){r.dataset.dirty='0';r.value=Number(ra).toFixed(6);r.dispatchEvent(new Event('input',{bubbles:true}))}if(d){d.dataset.dirty='0';d.value=Number(dec).toFixed(6);d.dispatchEvent(new Event('input',{bubbles:true}))}setTimeout(()=>{if(r){r.dataset.dirty='0';r.value=Number(ra).toFixed(6)}if(d){d.dataset.dirty='0';d.value=Number(dec).toFixed(6)}},50)}function catLoad(){setMsg('catMsg','Use Slew to Object','ok')}function catSlew(){let c=catSelected();if(!c){setMsg('catMsg','No catalog object selected','bad');return}if(!confirmAboveHorizonRaDec(c.ra,c.dec,'catMsg'))return;jsonAction('/webgoto_radec?ra_hours='+enc(Number(c.ra).toFixed(6))+'&dec_deg='+enc(Number(c.dec).toFixed(6)),'catMsg',function(){setTimeout(updateNow,1200)},'catalogSlew')}"));
-  server.sendContent(F("let lastStatus=null,targetsInitialized=false;function targetFieldsLocked(){return false}function lockTargetFields(ms){}function setText(n,v){let e=id(n);if(e)e.textContent=v}function setVal(n,v,fix){let e=id(n);if(!e||v===undefined||v===null||Number.isNaN(v))return;if(e.dataset.dirty==='1'||document.activeElement===e)return;if(fix!==undefined&&typeof v==='number')e.value=v.toFixed(fix);else e.value=v}function setChecked(n,v){let e=id(n);if(!e)return;if(e.dataset.dirty==='1'||document.activeElement===e)return;e.checked=!!v}function markDirty(){this.dataset.dirty='1'}function markRaDecDirty(){gotoRaDecDirty=true;markDirty.call(this)}function markAltAzDirty(){gotoAltAzDirty=true;markDirty.call(this)}function clearFieldsDirty(list){list.forEach(n=>{let e=id(n);if(e)e.dataset.dirty='0'})}function clearSiteDirty(){clearFieldsDirty(['lat','lon','offset','year','month','day','hour','minute','second','poll','idlepoll','handshake','throttle'])}function clearRateDirty(){clearFieldsDirty(['r1','r2','r3','r4','rateSel'])}function attachDirty(){['lat','lon','offset','year','month','day','hour','minute','second','poll','idlepoll','handshake','throttle','r1','r2','r3','r4','rateSel','wifi_ssid','wifi_pass','ap_ssid','ap_pass','ap_ip','lx200_port','stellarium_port','telnet_port','bridge_mode','ntp1','ntp2','tzrule','nearRadius','ntp_enable','dec_limit_enable','alt_limit_enable','dec_min','dec_max','alt_min','alt_max'].forEach(n=>{let e=id(n);if(e&&!e.dataset.bound){e.addEventListener('input',markDirty);e.addEventListener('change',markDirty);e.dataset.bound='1'}})}function setTargetRaDec(ra,dec){let r=id('ra_hours'),d=id('dec_deg');if(r)r.value=Number(ra).toFixed(6);if(d)d.value=Number(dec).toFixed(6)}function setTargetAltAz(alt,az){let a=id('alt_deg'),z=id('az_deg');if(a)a.value=Number(alt).toFixed(6);if(z)z.value=Number(az).toFixed(6)}function loadCurrentRaDecTarget(){if(!lastStatus)return;setTargetRaDec(lastStatus.raHours,lastStatus.decDeg);setMsg('gotoMsg','Loaded current RA/Dec into target fields','ok')}function loadCurrentAltAzTarget(){if(!lastStatus)return;setTargetAltAz(lastStatus.altDeg,lastStatus.azDeg);setMsg('altazMsg','Loaded current Alt/Az into target fields','ok')}function fillInputs(j){lastStatus=j;attachDirty();syncBridgeModeSelector();autoUpdatePointingId();setText('curRaHours',j.cacheValid?j.raHours.toFixed(6):'?');setText('curDecDeg',j.cacheValid?j.decDeg.toFixed(6):'?');setText('curAltDeg',j.altAzCacheValid?j.altDeg.toFixed(6):'?');setText('curAzDeg',j.altAzCacheValid?j.azDeg.toFixed(6):'?');let tzBanner=(typeof localTzAbbr==='function'&&j.timeValid)?localTzAbbr():'';setText('topDateTime',j.localYear+'-'+String(j.localMonth).padStart(2,'0')+'-'+String(j.localDay).padStart(2,'0')+' '+String(j.localHour).padStart(2,'0')+':'+String(j.localMinute).padStart(2,'0')+':'+String(j.localSecond).padStart(2,'0')+(tzBanner?' '+tzBanner:''));setText('topLat',Number(j.latitude).toFixed(6));setText('topLon',Number(j.longitude).toFixed(6));setText('topCpuLoad',j.cpuLoad||'CPU Load --%');if(!targetsInitialized){setTargetRaDec(j.raHours,j.decDeg);setTargetAltAz(j.altDeg,j.azDeg);targetsInitialized=true}setVal('lat',j.latitude,6);setVal('lon',j.longitude,6);setVal('offset',j.utcOffsetMinutes);setVal('poll',j.pollIntervalMs);setVal('handshake',j.handshakeTimeoutMs);setVal('throttle',j.clientThrottleMs);setVal('r1',j.nudgeRate1,3);setVal('r2',j.nudgeRate2,3);setVal('r3',j.nudgeRate3,3);setVal('r4',j.nudgeRate4,3);setVal('dec_min',j.safeDecMinDeg,2);setVal('dec_max',j.safeDecMaxDeg,2);setChecked('dec_limit_enable',j.safeDecLimitEnabled);setVal('alt_min',j.safeAltMinDeg,2);setVal('alt_max',j.safeAltMaxDeg,2);setChecked('alt_limit_enable',j.safeAltLimitEnabled);setVal('rateSel',j.webSelectedRate);setVal('year',j.localYear);setVal('month',j.localMonth);setVal('day',j.localDay);setVal('hour',j.localHour);setVal('minute',j.localMinute);setVal('second',j.localSecond);setVal('wifi_ssid',j.staSsid);setVal('ap_ssid',j.apSsid);setVal('ap_pass',j.apPass);setVal('ap_ip',j.apIpConfig);setVal('web_port',j.webPort);setVal('alpaca_port',j.alpacaPort);setVal('alpaca_discovery_port',j.alpacaDiscoveryPort);setVal('lx200_port',j.lx200Port);setVal('stellarium_port',j.stellariumPort);setVal('telnet_port',j.telnetPort);setVal('ntp1',j.ntpServer1);setVal('ntp2',j.ntpServer2);setVal('tzrule',j.tzRule);setVal('logLevelSel',j.logLevelName||'info');setChecked('ntp_enable',j.ntpEnabled);setText('ipLocStatus',j.approxIpLocationStatus);setText('ipLocLatLon',j.approxIpLocationValid?(Number(j.approxIpLat).toFixed(6)+', '+Number(j.approxIpLon).toFixed(6)):'none');setText('ipLocText',j.approxIpLocationText||'');if(typeof catRefreshLabels==='function')catRefreshLabels();if(typeof catUpdate==='function')catUpdate();if(typeof identifyPointingNow==='function'){}}"));
+  server.sendContent(F("let lastStatus=null,targetsInitialized=false;function targetFieldsLocked(){return false}function lockTargetFields(ms){}function setText(n,v){let e=id(n);if(e)e.textContent=v}function setVal(n,v,fix){let e=id(n);if(!e||v===undefined||v===null||Number.isNaN(v))return;if(e.dataset.dirty==='1'||document.activeElement===e)return;if(fix!==undefined&&typeof v==='number')e.value=v.toFixed(fix);else e.value=v}function setChecked(n,v){let e=id(n);if(!e)return;if(e.dataset.dirty==='1'||document.activeElement===e)return;e.checked=!!v}function markDirty(){this.dataset.dirty='1'}function markRaDecDirty(){gotoRaDecDirty=true;markDirty.call(this)}function markAltAzDirty(){gotoAltAzDirty=true;markDirty.call(this)}function clearFieldsDirty(list){list.forEach(n=>{let e=id(n);if(e)e.dataset.dirty='0'})}function clearSiteDirty(){clearFieldsDirty(['lat','lon','offset','year','month','day','hour','minute','second','poll','idlepoll','handshake','throttle','btwait'])}function clearRateDirty(){clearFieldsDirty(['r1','r2','r3','r4','rateSel'])}function attachDirty(){['lat','lon','offset','year','month','day','hour','minute','second','poll','idlepoll','handshake','throttle','btwait','r1','r2','r3','r4','rateSel','wifi_ssid','wifi_pass','ap_ssid','ap_pass','ap_ip','lx200_port','stellarium_port','telnet_port','ntp1','ntp2','tzrule','nearRadius','ntp_enable','dec_limit_enable','alt_limit_enable','dec_min','dec_max','alt_min','alt_max'].forEach(n=>{let e=id(n);if(e&&!e.dataset.bound){e.addEventListener('input',markDirty);e.addEventListener('change',markDirty);e.dataset.bound='1'}})}function setTargetRaDec(ra,dec){let r=id('ra_hours'),d=id('dec_deg');if(r)r.value=Number(ra).toFixed(6);if(d)d.value=Number(dec).toFixed(6)}function setTargetAltAz(alt,az){let a=id('alt_deg'),z=id('az_deg');if(a)a.value=Number(alt).toFixed(6);if(z)z.value=Number(az).toFixed(6)}function loadCurrentRaDecTarget(){if(!lastStatus)return;setTargetRaDec(lastStatus.raHours,lastStatus.decDeg);setMsg('gotoMsg','Loaded current RA/Dec into target fields','ok')}function loadCurrentAltAzTarget(){if(!lastStatus)return;setTargetAltAz(lastStatus.altDeg,lastStatus.azDeg);setMsg('altazMsg','Loaded current Alt/Az into target fields','ok')}function fillInputs(j){lastStatus=j;attachDirty();autoUpdatePointingId();setText('curRaHours',j.cacheValid?j.raHours.toFixed(6):'?');setText('curDecDeg',j.cacheValid?j.decDeg.toFixed(6):'?');setText('curAltDeg',j.altAzCacheValid?j.altDeg.toFixed(6):'?');setText('curAzDeg',j.altAzCacheValid?j.azDeg.toFixed(6):'?');let tzBanner=(typeof localTzAbbr==='function'&&j.timeValid)?localTzAbbr():'';setText('topDateTime',j.localYear+'-'+String(j.localMonth).padStart(2,'0')+'-'+String(j.localDay).padStart(2,'0')+' '+String(j.localHour).padStart(2,'0')+':'+String(j.localMinute).padStart(2,'0')+':'+String(j.localSecond).padStart(2,'0')+(tzBanner?' '+tzBanner:''));setText('topLat',Number(j.latitude).toFixed(6));setText('topLon',Number(j.longitude).toFixed(6));setText('topCpuLoad',j.cpuLoad||'CPU Load --%');if(!targetsInitialized){setTargetRaDec(j.raHours,j.decDeg);setTargetAltAz(j.altDeg,j.azDeg);targetsInitialized=true}setVal('lat',j.latitude,6);setVal('lon',j.longitude,6);setVal('offset',j.utcOffsetMinutes);setVal('poll',j.pollIntervalMs);setVal('handshake',j.handshakeTimeoutMs);setVal('throttle',j.clientThrottleMs);setVal('btwait',j.btWaitSeconds);setVal('r1',j.nudgeRate1,3);setVal('r2',j.nudgeRate2,3);setVal('r3',j.nudgeRate3,3);setVal('r4',j.nudgeRate4,3);setVal('dec_min',j.safeDecMinDeg,2);setVal('dec_max',j.safeDecMaxDeg,2);setChecked('dec_limit_enable',j.safeDecLimitEnabled);setVal('alt_min',j.safeAltMinDeg,2);setVal('alt_max',j.safeAltMaxDeg,2);setChecked('alt_limit_enable',j.safeAltLimitEnabled);setVal('rateSel',j.webSelectedRate);setVal('year',j.localYear);setVal('month',j.localMonth);setVal('day',j.localDay);setVal('hour',j.localHour);setVal('minute',j.localMinute);setVal('second',j.localSecond);setVal('wifi_ssid',j.staSsid);setVal('ap_ssid',j.apSsid);setVal('ap_pass',j.apPass);setVal('ap_ip',j.apIpConfig);setVal('web_port',j.webPort);setVal('alpaca_port',j.alpacaPort);setVal('alpaca_discovery_port',j.alpacaDiscoveryPort);setVal('lx200_port',j.lx200Port);setVal('stellarium_port',j.stellariumPort);setVal('telnet_port',j.telnetPort);setVal('ntp1',j.ntpServer1);setVal('ntp2',j.ntpServer2);setVal('tzrule',j.tzRule);setVal('logLevelSel',j.logLevelName||'info');setChecked('ntp_enable',j.ntpEnabled);setText('ipLocStatus',j.approxIpLocationStatus);setText('ipLocLatLon',j.approxIpLocationValid?(Number(j.approxIpLat).toFixed(6)+', '+Number(j.approxIpLon).toFixed(6)):'none');setText('ipLocText',j.approxIpLocationText||'');if(typeof catRefreshLabels==='function')catRefreshLabels();if(typeof catUpdate==='function')catUpdate();if(typeof identifyPointingNow==='function'){}}"));
   server.sendContent(F("const _fillInputsBase=fillInputs;fillInputs=function(j){_fillInputsBase(j);setVal('idlepoll',j.idlePollIntervalMs);let e=id('idlepoll');if(e&&!e.dataset.bound){e.addEventListener('input',markDirty);e.addEventListener('change',markDirty);e.dataset.bound='1'}};"));
   server.sendContent(F("let statusBusy=false;async function updateNow(){if(statusBusy)return;statusBusy=true;try{let j=await getJson('/status');let sc=id('statusCard');sc.classList.remove('alive','busy','idle','fault');if(j.mountFault){sc.classList.add('fault');setText('healthLine','MOUNT NOT RESPONDING');setText('healthLine2','MOUNT NOT RESPONDING')}else if(j.mountBusy){sc.classList.add('busy');setText('healthLine','MOUNT BUSY / SLEWING');setText('healthLine2','MOUNT BUSY / SLEWING')}else if(j.mountAlive){sc.classList.add('alive');setText('healthLine','MOUNT CONNECTED - '+j.lastResponseAgeMs+' ms');setText('healthLine2','MOUNT CONNECTED - '+j.lastResponseAgeMs+' ms')}else{sc.classList.add('idle');setText('healthLine','MOUNT UNKNOWN');setText('healthLine2','MOUNT UNKNOWN')}let sb=id('statusBox'),sy=id('sysBox');if(sb)sb.textContent=j.statusText;if(sy)sy.textContent=j.systemText;let bs=id('statusBasicBox'),bh=id('sysBasicBox');if(bs)bs.textContent=j.basicStatusText||'Status unavailable';if(bh)bh.textContent=j.basicSystemText||'System health unavailable';let la=id('logAlert');if(la){if(j.mountFault){la.classList.remove('off');la.textContent='MOUNT DISCONNECTED: '+(j.lastMountFault||'not responding')}else{la.classList.add('off');la.textContent=''}}fillInputs(j)}catch(e){}finally{statusBusy=false}}let logsLive=true,logsBusy=false;function selectedLogCats(){let a=[];document.querySelectorAll('.logcat').forEach(c=>{if(c.checked)a.push(c.value)});return a.length?a.join(','):'none'}function applyLogSettings(){jsonAction('/setlog?level='+enc(id('logLevelSel').value)+'&cats='+enc(selectedLogCats()),'logsMsg',function(){refreshLogs()},'applyLogSettings')}function toggleLogsLive(){logsLive=!logsLive;let b=id('logsLiveBtn');if(b)b.textContent=logsLive?'Pause Logs':'Start Logs';if(logsLive)refreshLogs()}async function refreshLogs(){if(!logsLive||logsBusy)return;logsBusy=true;try{let b=id('logBox');b.textContent=await getText('/logs');b.scrollTop=0}catch(e){}finally{logsBusy=false}}async function initialPageLoad(){applyScale();applyTheme();applyStatusMode();restoreTab();catPopulate();updateNow();refreshLogs();if(false){setTimeout(function(){startupReadAltAz()},900)}setTimeout(updateNow,2500);setTimeout(function(){updateNow();if(typeof catRefreshLabels==='function')catRefreshLabels();if(typeof catUpdate==='function')catUpdate()},4500)}const refreshJitter=Math.floor(Math.random()*1500);setInterval(updateNow,8000+refreshJitter);setInterval(refreshLogs,5000+refreshJitter);window.addEventListener('load',initialPageLoad);"));
   server.sendContent(F("function badge(ok,warn){return ok?'ok':(warn?'bad':'warn')}function age(ms){return ms?Math.round(ms/1000)+'s ago':'never'}function dashSet(n,t,c){let e=id(n);if(e){e.textContent=t;e.className='badge '+(c||'warn')}}function updateProtocolDash(j){let btRx=j.lx200BtRxCommands||0,btTx=j.lx200BtTxReplies||0,alpRx=(j.alpacaHttpRequests||0)>0,eff=j.effectivePollIntervalMs||0;dashSet('bMount',j.mountFault?'FAULT':(j.mountBusy?'BUSY':(j.mountAlive?'OK':'?')),j.mountAlive&&!j.mountFault,j.mountFault);dashSet('bTime',j.timeValid?'TIME OK':'TIME ?',j.timeValid,!j.timeValid);dashSet('bLoc',j.siteValid?'LOC OK':'LOC ?',j.siteValid,!j.siteValid);dashSet('bAlpaca',alpRx?'ALPACA OK':'ALPACA WAIT',alpRx,false);dashSet('bSky',j.bluetoothConnected?'BT SKY ON':(btRx?'BT SKY RX':(j.lx200WifiConnected?'WIFI SKY ON':(j.lx200WifiRxCommands?'WIFI SKY RX':'SKY WAIT'))),j.bluetoothConnected||btRx||j.lx200WifiConnected||j.lx200WifiRxCommands,false);dashSet('bStel',j.stellariumConnected?'STEL ON':(j.stellariumRxPackets?'STEL RX':'STEL WAIT'),j.stellariumConnected||j.stellariumRxPackets,false);let dm=id('dashMount');if(dm)dm.style.whiteSpace='pre-line';setText('dashMount','mount poll '+eff+' ms\\nmount uptime '+(j.mountUptime||'0:00')+' h:mm\\npoll age '+j.mountCurrentRaDecAgeMs+' ms');setText('dashTime','source '+j.timeSource+' / location '+j.locationSource);setText('dashPorts','web '+j.webPort+' / alpaca '+j.alpacaPort+' / SkySafari WiFi '+j.lx200Port+' / Stellarium '+j.stellariumPort+' / BT '+(j.bluetoothEnabled?'on':'off'));setText('dashProto','Alpaca req '+(j.alpacaHttpRequests||0)+' / Sky WiFi RX '+j.lx200WifiRxCommands+' TX '+j.lx200WifiTxReplies+' / Sky BT RX '+btRx+' TX '+btTx+' / Stell RX '+j.stellariumRxPackets+' TX '+j.stellariumTxPackets);setText('dashFault',j.logAlert?j.logAlertText:(j.lastMountFault||'none'));let tl=id('timeConfidence');if(tl){let cls=j.timeValid&&j.siteValid?'ok':'bad';tl.className='msg '+cls;tl.textContent=(j.timeValid&&j.siteValid?'Time/location valid: ':'Time/location warning: ')+'time='+j.timeSource+', location='+j.locationSource+', offset='+j.utcOffsetMinutes+' minutes'}}async function refreshProtocolDash(){try{updateProtocolDash(await getJson('/status'))}catch(e){}}setInterval(refreshProtocolDash,8000);"));
@@ -1164,21 +1144,21 @@ void sendWebPage() {
   server.sendContent(FW_NAME);
   server.sendContent(F(" "));
   server.sendContent(FW_VERSION);
-  server.sendContent(F("</h2><div class='scaleCtl'><button id='nightModeBtn' class='nightBtn' onclick='toggleNightMode()'>Red</button><button id='themeLightBtn' onclick=\"setBaseTheme('light')\">Light</button><button id='themeDarkBtn' onclick=\"setBaseTheme('dark')\">Dark</button><button onclick=\"location.href='/reboot?return='+encodeURIComponent(location.href)\">Reboot</button><button onclick=\"location.href='/setmode?mode=bt&return='+encodeURIComponent(location.href)\">BT</button><button onclick='scaleUi(-0.1)'>-</button><span id='scalePct'>100%</span><button onclick='scaleUi(0.1)'>+</button></div></div><div class='quick'><span id='healthLine'>Mount Unknown</span><br>Current RA <span id='curRaHours'>?</span> h / Dec <span id='curDecDeg'>?</span> deg<br>Current Alt <span id='curAltDeg'>?</span> deg / Az <span id='curAzDeg'>?</span> deg<br>Time <span id='topDateTime'>?</span><br>Lat <span id='topLat'>?</span> / Lon <span id='topLon'>?</span><br><span id='topCpuLoad'>CPU Load --%</span><br><span id='logAlert' class='logAlert off'></span></div><div id='timeConfidence' class='msg'>Checking time/location confidence...</div><div class='dash'><div class='card tight'><h3>Mount</h3><span id='bMount' class='badge warn'>?</span><div id='dashMount' class='small'>Loading...</div></div><div class='card tight'><h3>Time / Location</h3><span id='bTime' class='badge warn'>?</span><span id='bLoc' class='badge warn'>?</span><div id='dashTime' class='small'>Loading...</div></div><div class='card tight'><h3>Protocols</h3><span id='bAlpaca' class='badge warn'>?</span><span id='bSky' class='badge warn'>?</span><span id='bStel' class='badge warn'>?</span><div id='dashProto' class='small'>Loading...</div></div><div class='card tight'><h3>Ports / Fault</h3><div id='dashPorts' class='small'>Loading...</div><div id='dashFault' class='small'>none</div></div></div><div class='tabs'><button id='btn_control' onclick='showTab(&quot;control&quot;)'>Control</button><button id='btn_status' onclick='showTab(&quot;status&quot;)'>Status</button><button id='btn_setup' onclick='showTab(&quot;setup&quot;)'>Setup</button><button id='btn_logs' onclick='showTab(&quot;logs&quot;)'>Logs</button></div><div class='grid'>"));
+  server.sendContent(F("</h2><div class='scaleCtl'><button id='nightModeBtn' class='nightBtn' onclick='toggleNightMode()' title='Switches the browser to the red night-vision color scheme'>Red</button><button id='themeLightBtn' onclick=\"setBaseTheme('light')\" title='Uses the light browser color scheme'>Light</button><button id='themeDarkBtn' onclick=\"setBaseTheme('dark')\" title='Uses the dark browser color scheme'>Dark</button><button onclick=\"location.href='/reboot?return='+encodeURIComponent(location.href)\" title='Restarts the ESP32; active connections and mount transactions will be interrupted'>Reboot</button><button onclick='scaleUi(-0.1)' title='Decrease browser UI scale'>-</button><span id='scalePct' title='Current browser UI scale'>100%</span><button onclick='scaleUi(0.1)' title='Increase browser UI scale'>+</button></div></div><div class='quick'><span id='healthLine'>Mount Unknown</span><br>Current RA <span id='curRaHours'>?</span> h / Dec <span id='curDecDeg'>?</span> deg<br>Current Alt <span id='curAltDeg'>?</span> deg / Az <span id='curAzDeg'>?</span> deg<br>Time <span id='topDateTime'>?</span><br>Lat <span id='topLat'>?</span> / Lon <span id='topLon'>?</span><br><span id='topCpuLoad'>CPU Load --%</span><br><span id='logAlert' class='logAlert off'></span></div><div id='timeConfidence' class='msg'>Checking time/location confidence...</div><div class='dash'><div class='card tight'><h3>Mount</h3><span id='bMount' class='badge warn'>?</span><div id='dashMount' class='small'>Loading...</div></div><div class='card tight'><h3>Time / Location</h3><span id='bTime' class='badge warn'>?</span><span id='bLoc' class='badge warn'>?</span><div id='dashTime' class='small'>Loading...</div></div><div class='card tight'><h3>Protocols</h3><span id='bAlpaca' class='badge warn'>?</span><span id='bSky' class='badge warn'>?</span><span id='bStel' class='badge warn'>?</span><div id='dashProto' class='small'>Loading...</div></div><div class='card tight'><h3>Ports / Fault</h3><div id='dashPorts' class='small'>Loading...</div><div id='dashFault' class='small'>none</div></div></div><div class='tabs'><button id='btn_control' onclick='showTab(&quot;control&quot;)'>Control</button><button id='btn_status' onclick='showTab(&quot;status&quot;)'>Status</button><button id='btn_setup' onclick='showTab(&quot;setup&quot;)'>Setup</button><button id='btn_logs' onclick='showTab(&quot;logs&quot;)'>Logs</button></div><div class='grid'>"));
   server.sendContent(F("<div id='tab_control' class='tab active'>"));
    server.sendContent(F("<script>setTimeout(refreshProtocolDash,700);</script>"));
    // Reuse the main status poll for the protocol dashboard.  The dashboard
    // previously issued a second /status request every eight seconds, which
    // duplicated JSON construction and competed with the main status update.
    server.sendContent(F("<script>const _fillInputsWithDashboard=fillInputs;fillInputs=function(j){_fillInputsWithDashboard(j);if(typeof updateProtocolDash==='function')updateProtocolDash(j)};refreshProtocolDash=function(){};const _getJsonForPolling=getJson;getJson=async function(u){if(document.hidden&&u==='/status'&&lastStatus)return lastStatus;return _getJsonForPolling(u)};</script>"));
-   server.sendContent(F("<div class='card'><h3>Catalog Goto</h3><div id='catMsg' class='msg'></div><div class='formrow'><label>Search all objects</label><input id='cat_search' oninput='catPopulate()' placeholder='Moon, Jupiter, M31, Rosette, Vega'></div><div class='formrow'><label>Group</label><select id='cat_group'><option value='solar'>Planetary / Solar System</option><option value='messier'>Deep Sky / Messier+</option><option value='galaxy'>Galaxies</option><option value='nebula'>Nebulae</option><option value='planetary_nebula'>Planetary Nebulae</option><option value='globular'>Globular Clusters</option><option value='open'>Open Clusters</option><option value='stars'>Bright Stars</option><option value='bsc'>BSC5 Bright Stars</option></select></div><div class='formrow'><label>Sort</label><select id='cat_sort' onchange='catPopulate()'><option value='brightness' selected>Brightness</option><option value='visibility'>Visibility / altitude</option><option value='name'>Name</option></select></div><div class='formrow'><label>Selected</label><select id='cat_obj' onchange='catUpdate()'></select></div><div class='formrow'><label>Current</label><input id='pointingIdBox' readonly value='not checked yet' style='width:100%;max-width:100%;'></div><div class='formrow'><label>Nearby radius deg</label><input id='nearRadius' value='10' style='width:70px' oninput='lastPointingIdKey=&quot;&quot;;identifyPointingNow()' onchange='lastPointingIdKey=&quot;&quot;;identifyPointingNow()'></div><div class='formrow'><label>Nearby object</label><select id='nearestSelect' onchange='selectNearestCandidate()'><option value='' selected>Select a nearby object</option></select></div><div class='hint'>Nearby shown: <span id='nearCount'>0</span></div><div class='actions'><button onclick='catSlew()'>Slew to Object</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>Catalog Goto</h3><div id='catMsg' class='msg'></div><div class='formrow'><label>Search all objects</label><input id='cat_search' oninput='catPopulate()' placeholder='Moon, Jupiter, M31, Rosette, Vega' title='Searches the available catalog objects by name or identifier'></div><div class='formrow'><label>Group</label><select id='cat_group' title='Choose which catalog group to display'><option value='solar'>Planetary / Solar System</option><option value='messier'>Deep Sky / Messier+</option><option value='galaxy'>Galaxies</option><option value='nebula'>Nebulae</option><option value='planetary_nebula'>Planetary Nebulae</option><option value='globular'>Globular Clusters</option><option value='open'>Open Clusters</option><option value='stars'>Bright Stars</option><option value='bsc'>BSC5 Bright Stars</option></select></div><div class='formrow'><label>Sort</label><select id='cat_sort' onchange='catPopulate()' title='Sort by brightness, visibility/altitude, or name'><option value='brightness' selected>Brightness</option><option value='visibility'>Visibility / altitude</option><option value='name'>Name</option></select></div><div class='formrow'><label>Selected</label><select id='cat_obj' onchange='catUpdate()' title='Select an object to view its coordinates and safety status'></select></div><div class='formrow'><label>Current</label><input id='pointingIdBox' readonly value='not checked yet' style='width:100%;max-width:100%;' title='Current mount pointing used for nearby-object matching'></div><div class='formrow'><label>Nearby radius deg</label><input id='nearRadius' value='10' style='width:70px' title='Search radius around the current pointing position, in degrees' oninput='lastPointingIdKey=&quot;&quot;;identifyPointingNow()' onchange='lastPointingIdKey=&quot;&quot;;identifyPointingNow()'></div><div class='formrow'><label>Nearby object</label><select id='nearestSelect' onchange='selectNearestCandidate()' title='Objects within the selected nearby radius'><option value='' selected>Select a nearby object</option></select></div><div class='hint'>Nearby shown: <span id='nearCount'>0</span></div><div class='actions'><button onclick='catSlew()' title='Checks horizon and altitude safety limits before sending the GOTO'>Slew to Object</button></div></div>"));
   server.sendContent(F("<script>function catGroupSelected(){let s=id('cat_search');if(s&&s.value)s.value='';let g=id('cat_group');if(g&&g.value==='bsc'&&!catBSCLoaded)loadBSC5().then(()=>catPopulate());catPopulate()}setTimeout(function(){let g=id('cat_group');if(g&&!g.dataset.bound){g.addEventListener('change',catGroupSelected);g.dataset.bound='1'}if(typeof catPopulate==='function')catPopulate();},250);</script>"));
   server.sendContent(F("<style>#cat_obj option.belowHorizon,#nearestSelect option.belowHorizon{color:#8a8a8a;background:#1a1a1a}.themeLight #cat_obj option.belowHorizon,.themeLight #nearestSelect option.belowHorizon{color:#777;background:#e7e9ee}.themeNight #cat_obj option.belowHorizon,.themeNight #nearestSelect option.belowHorizon{color:#8c3030;background:#120000}</style><script>function catIsBelowHorizon(c){let aa=c?catAltAzFromRaDec(c.ra,c.dec):null;return !!(aa&&isFinite(aa.alt)&&aa.alt<0)}function catDecoratedOptionText(x){return catOptionText(x)}function catPopulate(){setText('bscCount',String(catBscCount()));let o=id('cat_obj');if(!o)return;let arr=catArray(),old=o.value;o.innerHTML='';arr.forEach(x=>{let op=document.createElement('option'),c=x.src==='solar'?simpleSolar(x.id):x,below=catIsBelowHorizon(c);op.value=(x.src||'dso')+':'+x.id;op.textContent=catDecoratedOptionText(x);if(below){op.className='belowHorizon';op.dataset.below='1';op.style.color='#777';op.style.backgroundColor='#222'}o.appendChild(op)});setText('catShown',String(arr.length));setText('catTotal',String(window.catTotalBeforeLimit||arr.length));if(old){for(let i=0;i<o.options.length;i++){if(o.options[i].value===old){o.selectedIndex=i;break}}}if(o.selectedIndex<0&&o.options.length>0)o.selectedIndex=0;catUpdate()}function catRefreshLabels(){let o=id('cat_obj');if(!o)return;let arr=catArray(),m={};arr.forEach(x=>{m[(x.src||'dso')+':'+x.id]=catDecoratedOptionText(x)});for(let i=0;i<o.options.length;i++){let v=o.options[i].value;if(m[v])o.options[i].textContent=m[v]}}function catUpdate(){let c=catSelected();if(!c){catSetInfo('RA ? / Dec ?<br>Sky Alt ? / Az ?<br>Mount Alt ? / Az ?');return}let aa=catAltAzFromRaDec(c.ra,c.dec),below=catIsBelowHorizon(c);let coord=(below?'Below horizon<br>':'')+'RA '+hms(c.ra)+' h / Dec '+dms(c.dec)+' deg<br>Sky Alt '+(aa?Number(aa.alt).toFixed(2):'?')+' deg / Az '+(aa?Number(aa.az).toFixed(2):'?')+' deg';coord+='<br>Mount Alt '+(lastStatus&&lastStatus.altAzCacheValid?Number(lastStatus.altDeg).toFixed(2):'?')+' deg / Az '+(lastStatus&&lastStatus.altAzCacheValid?Number(lastStatus.azDeg).toFixed(2):'?')+' deg';if(c.approx)coord+=' APPROX ephemeris';catSetInfo(coord)}</script>"));
-  server.sendContent(F("<div class='card'><h3>Manual Nudge</h3><div id='mainMsg' class='msg'></div><div class='formrow'><label>Rate</label><select id='rateSel' onchange='setRate()'><option value='1'>Rate 1</option><option value='2'>Rate 2</option><option value='3'>Rate 3</option><option value='4'>Rate 4</option></select></div><div class='pad'><div><button onclick=\"nudge('n')\">Up</button></div><div><button onclick=\"nudge('w')\">Left</button><button onclick=\"nudge('e')\">Right</button></div><div><button onclick=\"nudge('s')\">Down</button></div></div></div>"));
+  server.sendContent(F("<div class='card'><h3>Manual Nudge</h3><div id='mainMsg' class='msg'></div><div class='formrow'><label>Rate</label><select id='rateSel' onchange='setRate()' title='Selects the mount movement rate configured for each rate number'><option value='1'>Rate 1</option><option value='2'>Rate 2</option><option value='3'>Rate 3</option><option value='4'>Rate 4</option></select></div><div class='pad'><div><button onclick=\"nudge('n')\" title='Move the mount upward at the selected rate'>Up</button></div><div><button onclick=\"nudge('w')\" title='Move the mount left at the selected rate'>Left</button><button onclick=\"nudge('e')\" title='Move the mount right at the selected rate'>Right</button></div><div><button onclick=\"nudge('s')\" title='Move the mount downward at the selected rate'>Down</button></div></div></div>"));
 
-  server.sendContent(F("<div class='card'><h3>GOTO RA/Dec</h3><div id='gotoMsg' class='msg'></div><div class='formrow'><label>Target RA hours</label><input id='ra_hours'></div><div class='formrow'><label>Target Dec deg</label><input id='dec_deg'></div><div class='actions'><button onclick='gotoRaDec()'>GOTO RA/Dec</button><button onclick='readRaDec()'>Load Current RA/Dec</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>GOTO RA/Dec</h3><div id='gotoMsg' class='msg'></div><div class='formrow'><label>Target RA hours</label><input id='ra_hours' title='Right ascension in decimal hours, from 0 up to but not including 24'></div><div class='formrow'><label>Target Dec deg</label><input id='dec_deg' title='Declination in decimal degrees, from -90 through +90'></div><div class='actions'><button onclick='gotoRaDec()' title='Checks horizon and configured safety limits before sending the GOTO'>GOTO RA/Dec</button><button onclick='readRaDec()' title='Reads the current cached mount RA and Dec'>Load Current RA/Dec</button></div></div>"));
 
-  server.sendContent(F("<div class='card'><h3>GOTO Alt/Az</h3><div id='altazMsg' class='msg'></div><div class='formrow'><label>Target Alt deg</label><input id='alt_deg'></div><div class='formrow'><label>Target Az deg</label><input id='az_deg'></div><div class='actions'><button onclick='gotoAltAz()'>GOTO Alt/Az</button><button onclick='readAltAz()'>Load Current Alt/Az</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>GOTO Alt/Az</h3><div id='altazMsg' class='msg'></div><div class='formrow'><label>Target Alt deg</label><input id='alt_deg' title='Altitude in decimal degrees, from -90 through +90'></div><div class='formrow'><label>Target Az deg</label><input id='az_deg' title='Azimuth in decimal degrees, from 0 up to but not including 360'></div><div class='actions'><button onclick='gotoAltAz()' title='Checks horizon and configured safety limits before sending the GOTO'>GOTO Alt/Az</button><button onclick='readAltAz()' title='Reads the current cached mount Altitude and Azimuth'>Load Current Alt/Az</button></div></div>"));
   server.sendContent(F("</div>"));
 
   server.sendContent(F("<div id='tab_status' class='tab'>"));
@@ -1186,25 +1166,29 @@ void sendWebPage() {
   server.sendContent(F("</div>"));
 
   server.sendContent(F("<div id='tab_setup' class='tab'>"));
-  server.sendContent(F("<div class='card'><h3>Site / Time / Polling</h3><div id='siteMsg' class='msg'></div><div class='formrow'><label>Latitude</label><input id='lat'></div><div class='formrow'><label>Longitude east-positive</label><input id='lon'></div><div class='formrow'><label>UTC offset minutes</label><input id='offset'></div><div class='formrow'><label>Date</label><div><input id='year' style='width:78px'> - <input id='month' style='width:58px'> - <input id='day' style='width:58px'></div></div><div class='formrow'><label>Time</label><div><input id='hour' style='width:58px'> : <input id='minute' style='width:58px'> : <input id='second' style='width:58px'></div></div><div class='formrow'><label>Active poll ms</label><input id='poll'></div><div class='formrow'><label>Idle poll ms</label><input id='idlepoll'></div><div class='formrow'><label>Handshake timeout ms</label><input id='handshake'></div><div class='formrow'><label>Client throttle ms</label><input id='throttle'></div><div class='actions'><button onclick='saveManualSiteTime()'>Save Site / Time / Polling</button><button onclick='startHttpsTimeLocation()'>GPS Sync</button><button onclick='clearSavedSite()'>Clear Saved Last Location</button></div><div class='hint'>Active poll is used while clients request position. Idle poll is used when no client is actively demanding position. Handshake timeout controls how long NexStar '?' waits for '#'.</div></div>"));
-  server.sendContent(F("<div class='card'><h3>Time / NTP</h3><div id='ntpMsg' class='msg'></div><div class='formrow'><label>Enable NTP</label><label style='font-weight:normal'><input type='checkbox' id='ntp_enable'></label></div><div class='formrow'><label>NTP server 1</label><input id='ntp1' value='pool.ntp.org'></div><div class='formrow'><label>NTP server 2</label><input id='ntp2' value='time.nist.gov'></div><div class='formrow'><label>TZ / DST rule</label><input id='tzrule' value='MST7MDT,M3.2.0/2,M11.1.0/2'></div><div class='actions'><button onclick='saveNtp()'>Save NTP Settings</button><button onclick='syncNtp()'>Sync NTP Now</button></div><div class='hint'>Uses STA WiFi or phone hotspot internet. Default TZ is US Mountain with DST.</div></div>"));
-  server.sendContent(F("<div class='card'><h3>Approx Internet Location</h3><div id='ipLocMsg' class='msg'></div><p class='small'>Uses public IP geolocation. City-level only; verify before precision alignment.</p>Status: <span id='ipLocStatus'>Not fetched</span><br>Lat/Lon: <span id='ipLocLatLon'>none</span><br><span id='ipLocText' class='small'></span><br><button onclick='fetchIpLoc()'>Get Approx Location</button><button onclick='useIpLoc()'>Use This Location</button></div>"));
+  server.sendContent(F("<div class='card'><h3>Site / Time / Polling</h3><div id='siteMsg' class='msg'></div><div class='formrow'><label>Latitude</label><input id='lat' title='Observer latitude in decimal degrees'></div><div class='formrow'><label>Longitude east-positive</label><input id='lon' title='Observer longitude in decimal degrees; east is positive and west is negative'></div><div class='formrow'><label>UTC offset minutes</label><input id='offset' title='Local time offset from UTC in minutes; for example, Mountain Daylight Time is -360'></div><div class='formrow'><label>Date</label><div><input id='year' style='width:78px' title='Local calendar year'> - <input id='month' style='width:58px' title='Local calendar month, 1 through 12'> - <input id='day' style='width:58px' title='Local calendar day'></div></div><div class='formrow'><label>Time</label><div><input id='hour' style='width:58px' title='Local hour, 0 through 23'> : <input id='minute' style='width:58px' title='Local minute, 0 through 59'> : <input id='second' style='width:58px' title='Local second, 0 through 59'></div></div><div class='formrow'><label>Active poll ms</label><input id='poll' title='Polling interval while a client actively requests mount position; lower values increase activity'></div><div class='formrow'><label>Idle poll ms</label><input id='idlepoll' title='Polling interval when no client actively requests position; longer values reduce background traffic'></div><div class='formrow'><label>Handshake timeout ms</label><input id='handshake' title='Maximum time to wait for the mount # reply after sending the NexStar ? handshake'></div><div class='formrow'><label>Client throttle ms</label><input id='throttle' title='Minimum interval between position responses to clients; helps prevent request overload'></div><div class='formrow'><label>BT Wait <span title='Seconds the bridge waits for a Bluetooth client after reset. A client connecting keeps Bluetooth-only mode; otherwise Full Wi-Fi starts automatically.' tabindex='0' aria-label='BT Wait information' style='cursor:help;color:#8cc7ff'>?</span></label><input id='btwait' type='number' min='10' max='300'></div><div class='actions'><button onclick='saveManualSiteTime()'>Save Site / Time / Polling</button><button onclick='startHttpsTimeLocation()' title='Opens a temporary local HTTPS page to populate valid time and location; accept the certificate warning if shown'>GPS Sync</button><button onclick='clearSavedSite()' title='Removes the stored site location; a valid location is required for reliable mount polling'>Clear Saved Last Location</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>Time / NTP</h3><div id='ntpMsg' class='msg'></div><div class='formrow'><label>Enable NTP</label><label style='font-weight:normal'><input type='checkbox' id='ntp_enable' title='Enables automatic clock synchronization when network Internet access is available'></label></div><div class='formrow'><label>NTP server 1</label><input id='ntp1' value='pool.ntp.org' title='Primary network time server'></div><div class='formrow'><label>NTP server 2</label><input id='ntp2' value='time.nist.gov' title='Fallback network time server'></div><div class='formrow'><label>TZ / DST rule</label><input id='tzrule' value='MST7MDT,M3.2.0/2,M11.1.0/2' title='POSIX time-zone and daylight-saving rule used to display local time'></div><div class='actions'><button onclick='saveNtp()'>Save NTP Settings</button><button onclick='syncNtp()' title='Immediately requests time from the configured NTP servers; requires STA Wi-Fi or hotspot Internet access'>Sync NTP Now</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>Approx Internet Location</h3><div id='ipLocMsg' class='msg'></div>Status: <span id='ipLocStatus'>Not fetched</span><br>Lat/Lon: <span id='ipLocLatLon'>none</span><br><span id='ipLocText' class='small'></span><br><button onclick='fetchIpLoc()' title='Fetches approximate city-level coordinates from public IP geolocation; results may be inaccurate'>Get Approx Location</button><button onclick='useIpLoc()' title='Copies the fetched approximate coordinates into the site/location fields; verify them before saving'>Use This Location</button></div>"));
   server.sendContent(F("<div class='card'><h3>STA WiFi Setup</h3><div id='wifiMsg' class='msg'></div><div class='formrow'><label>STA SSID</label><input id='wifi_ssid'></div><div class='formrow'><label>STA Password</label><input id='wifi_pass' type='text' value='"));
   server.sendContent(htmlEscape(staPass));
-  server.sendContent(F("'></div><div class='actions'><button onclick='saveWifi()'>Save / Connect STA</button><button onclick='clearWifi()'>Switch To AP Only</button></div><div class='hint'>When STA is configured, the unit runs STA-only. If STA fails, it falls back to AP-only.</div></div>"));
-  server.sendContent(F("<div class='card'><h3>AP Setup</h3><div id='apMsg' class='msg'></div><div class='formrow'><label>AP SSID</label><input id='ap_ssid'></div><div class='formrow'><label>AP Password</label><input id='ap_pass' type='text'></div><div class='formrow'><label>AP IP</label><input id='ap_ip'></div><div class='actions'><button onclick='saveAp()'>Save AP / Server Config</button></div><div class='hint'>Password may be blank/open or at least 8 characters. The AP SSID box shows the full broadcast name.</div></div>"));
-  server.sendContent(F("<div class='card'><h3>Nudge Rates</h3><div id='settingsMsg' class='msg'></div><div class='formrow'><label>Rate 1 deg</label><input id='r1'></div><div class='formrow'><label>Rate 2 deg</label><input id='r2'></div><div class='formrow'><label>Rate 3 deg</label><input id='r3'></div><div class='formrow'><label>Rate 4 deg</label><input id='r4'></div><div class='actions'><button onclick='saveRates()'>Save Rates</button><button onclick='resetRates()'>Reset Defaults</button></div></div>"));
-  server.sendContent(F("<div class='card'><h3>Altitude Safety Limits</h3><div id='altLimitMsg' class='msg'></div><div class='formrow'><label>Enable limit</label><label style='font-weight:normal'><input type='checkbox' id='alt_limit_enable'></label></div><div class='formrow'><label>Minimum Alt deg</label><input id='alt_min' value='0'></div><div class='formrow'><label>Maximum Alt deg</label><input id='alt_max' value='85'></div><div class='actions'><button onclick='saveAltLimits()'>Save Alt Limits</button></div><div class='hint'>Blocks targets too low or too high. Use this to prevent near-zenith tube/mount clearance problems, such as Alt 86 deg.</div></div>"));
-  server.sendContent(F("<div class='card'><h3>Bridge Mode</h3><div id='bridgeModeMsg' class='msg'>Current mode: <span id='bridge_mode_current'>loading...</span></div><div class='formrow'><label>Mode</label><select id='bridge_mode'><option value='wifi'>mode wifi - Full WiFi web + protocol servers</option><option value='wifi-noweb'>mode wifi noweb - Protocol servers, no Web UI</option><option value='web'>mode web - Web UI + Telnet only</option><option value='bt'>mode bt - Bluetooth + Telnet setup AP</option></select></div><div class='actions'><button onclick='saveBridgeModeWeb()'>Save Mode / Reboot</button></div><div class='hint'>Changing mode saves the selected bridge mode and restarts the controller. GPIO startup pins still override saved mode during boot.</div></div>"));
-  server.sendContent(F("<div class='card'><h3>Connection / Server Config</h3><div id='connCfgMsg' class='msg'></div><div class='hint'>These are saved configuration values. Port changes automatically restart the device.</div><div class='formrow'><label>Web UI HTTP port</label><input id='web_port' disabled></div><div class='formrow'><label>Alpaca HTTP port</label><input id='alpaca_port' disabled></div><div class='formrow'><label>Alpaca Discovery UDP port</label><input id='alpaca_discovery_port' disabled></div><div class='formrow'><label>SkySafari LX200 port</label><input id='lx200_port'></div><div class='formrow'><label>Stellarium port</label><input id='stellarium_port'></div><div class='formrow'><label>Telnet console port</label><input id='telnet_port'></div><div class='formrow'><label>Telnet password</label><input id='telnet_pass' type='text' placeholder='blank disables password'></div><div class='actions'><button onclick='saveConnCfg()'>Save Server Config</button><button onclick='defaultConnCfg()'>Defaults</button></div><div class='hint'>Web UI uses port 80. Alpaca uses its own HTTP listener on port 11111. Discovery uses the separate UDP port shown above. Telnet default is port 23; password changes require reconnect, port changes restart the device.</div></div>"));
+  server.sendContent(F("'></div><div class='actions'><button onclick='saveWifi()' title='Saves the STA credentials and attempts to connect; a reboot may be required before the new configuration is active'>Save / Connect STA</button><button onclick='clearWifi()' title='Clears saved STA credentials and switches startup to AP-only'>Switch To AP Only</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>AP Setup</h3><div id='apMsg' class='msg'></div><div class='formrow'><label>AP SSID</label><input id='ap_ssid' title='Name broadcast by the bridge access point'></div><div class='formrow'><label>AP Password</label><input id='ap_pass' type='text' title='May be blank/open or at least 8 characters'></div><div class='formrow'><label>AP IP</label><input id='ap_ip' title='Local address used to open the Web UI while connected to the bridge access point'></div><div class='actions'><button onclick='saveAp()' title='Saves the access-point and server settings; network changes may require a reboot'>Save AP / Server Config</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>Nudge Rates</h3><div id='settingsMsg' class='msg'></div><div class='formrow'><label>Rate 1 deg</label><input id='r1' title='Mount movement rate used when Rate 1 is selected'></div><div class='formrow'><label>Rate 2 deg</label><input id='r2' title='Mount movement rate used when Rate 2 is selected'></div><div class='formrow'><label>Rate 3 deg</label><input id='r3' title='Mount movement rate used when Rate 3 is selected'></div><div class='formrow'><label>Rate 4 deg</label><input id='r4' title='Mount movement rate used when Rate 4 is selected'></div><div class='actions'><button onclick='saveRates()'>Save Rates</button><button onclick='resetRates()' title='Restores the default movement-rate values'>Reset Defaults</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>Altitude Safety Limits</h3><div id='altLimitMsg' class='msg'></div><div class='formrow'><label>Enable limit</label><label style='font-weight:normal'><input type='checkbox' id='alt_limit_enable' title='When enabled, blocks GOTO targets outside the configured altitude range'></label></div><div class='formrow'><label>Minimum Alt deg</label><input id='alt_min' value='0' title='Lowest altitude allowed for a GOTO target'></div><div class='formrow'><label>Maximum Alt deg</label><input id='alt_max' value='85' title='Highest altitude allowed for a GOTO target; useful for preventing near-zenith clearance problems'></div><div class='actions'><button onclick='saveAltLimits()'>Save Alt Limits</button></div></div>"));
+  server.sendContent(F("<div class='card'><h3>Connection / Server Config</h3><div id='connCfgMsg' class='msg'></div><div class='formrow'><label>Web UI HTTP port</label><input id='web_port' disabled title='Fixed Web UI port; currently 80'></div><div class='formrow'><label>Alpaca HTTP port</label><input id='alpaca_port' disabled title='Fixed Alpaca HTTP port; currently 11111'></div><div class='formrow'><label>Alpaca Discovery UDP port</label><input id='alpaca_discovery_port' disabled title='Fixed UDP discovery port used to find the Alpaca service'></div><div class='formrow'><label>SkySafari LX200 port</label><input id='lx200_port' title='TCP port used by SkySafari and LX200 clients'></div><div class='formrow'><label>Stellarium port</label><input id='stellarium_port' title='TCP port used by Stellarium clients'></div><div class='formrow'><label>Telnet console port</label><input id='telnet_port' title='TCP port used by the Telnet console; default is 23'></div><div class='formrow'><label>Telnet password</label><input id='telnet_pass' type='text' placeholder='blank disables password' title='Leave blank to disable Telnet authentication; password changes require reconnecting'></div><div class='actions'><button onclick='saveConnCfg()' title='Saves server settings; port changes restart the device'>Save Server Config</button><button onclick='defaultConnCfg()' title='Restores the default protocol and Telnet port values'>Defaults</button></div></div>"));
   server.sendContent(F("</div>"));
 
   server.sendContent(F("<div id='tab_logs' class='tab' style='grid-template-columns:1fr'>"));
-  server.sendContent(F("<div class='card logs'><h3>Logs</h3><p class='hint'>Log level: 0 none, 1 error, 2 warn, 3 info, 4 debug, 5 trace. Systems select which firmware areas are shown. The serial monitor mirrors the same timestamped, filtered log lines.</p><div id='logsMsg' class='msg'></div>Log Level<br><select id='logLevelSel' onchange='applyLogSettings()'><option value='error'>error</option><option value='warn' selected>warn</option><option value='info'>info</option><option value='debug'>debug</option><option value='trace'>trace</option><option value='none'>none</option></select><div class='loggrid'><label><input class='logcat' type='checkbox' value='mount' checked onchange='applyLogSettings()'><span>mount</span></label><label><input class='logcat' type='checkbox' value='skysafari' checked onchange='applyLogSettings()'><span>SkySafari</span></label><label><input class='logcat' type='checkbox' value='bluetooth' checked onchange='applyLogSettings()'><span>Bluetooth</span></label><label><input class='logcat' type='checkbox' value='alpaca' checked onchange='applyLogSettings()'><span>Alpaca</span></label><label><input class='logcat' type='checkbox' value='stellarium' checked onchange='applyLogSettings()'><span>Stellarium</span></label><label><input class='logcat' type='checkbox' value='web' checked onchange='applyLogSettings()'><span>web</span></label><label><input class='logcat' type='checkbox' value='wifi' checked onchange='applyLogSettings()'><span>WiFi</span></label><label><input class='logcat' type='checkbox' value='timeloc' checked onchange='applyLogSettings()'><span>time/location</span></label><label><input class='logcat' type='checkbox' value='settings' checked onchange='applyLogSettings()'><span>settings</span></label><label><input class='logcat' type='checkbox' value='system' checked onchange='applyLogSettings()'><span>system</span></label></div><div class='row'><button id='logsLiveBtn' onclick='toggleLogsLive()'>Pause Logs</button><button onclick='clearLogs();refreshLogs()'>Clear Logs</button></div><p class='small'>Newest entries appear at the top. Pause stops updating the window, not internal logging.</p><pre id='logBox'>Waiting for logs...</pre></div>"));
+  server.sendContent(F("<div class='card logs'><h3>Logs</h3><div id='logsMsg' class='msg'></div>Log Level<br><select id='logLevelSel' onchange='applyLogSettings()' title='Controls verbosity: Error, Warn, Info, Debug, Trace, or None. Higher levels use more CPU and serial bandwidth'><option value='error'>error</option><option value='warn' selected>warn</option><option value='info'>info</option><option value='debug'>debug</option><option value='trace'>trace</option><option value='none'>none</option></select><div class='loggrid'><label><input class='logcat' type='checkbox' value='mount' checked onchange='applyLogSettings()'><span>mount</span></label><label><input class='logcat' type='checkbox' value='skysafari' checked onchange='applyLogSettings()'><span>SkySafari</span></label><label><input class='logcat' type='checkbox' value='bluetooth' checked onchange='applyLogSettings()'><span>Bluetooth</span></label><label><input class='logcat' type='checkbox' value='alpaca' checked onchange='applyLogSettings()'><span>Alpaca</span></label><label><input class='logcat' type='checkbox' value='stellarium' checked onchange='applyLogSettings()'><span>Stellarium</span></label><label><input class='logcat' type='checkbox' value='web' checked onchange='applyLogSettings()'><span>web</span></label><label><input class='logcat' type='checkbox' value='wifi' checked onchange='applyLogSettings()'><span>WiFi</span></label><label><input class='logcat' type='checkbox' value='timeloc' checked onchange='applyLogSettings()'><span>time/location</span></label><label><input class='logcat' type='checkbox' value='settings' checked onchange='applyLogSettings()'><span>settings</span></label><label><input class='logcat' type='checkbox' value='system' checked onchange='applyLogSettings()'><span>system</span></label></div><div class='row'><button id='logsLiveBtn' onclick='toggleLogsLive()' title='Pauses only the browser log display; firmware logging continues'>Pause Logs</button><button onclick='clearLogs();refreshLogs()' title='Clears the stored local log entries'>Clear Logs</button></div><p class='small'>Newest entries appear at the top.</p><pre id='logBox'>Waiting for logs...</pre></div>"));
   server.sendContent(F("</div>"));
 
   server.sendContent(F("<script>const _nscStatusUpdate=updateNow;updateNow=async function(){await _nscStatusUpdate();let b=id('statusBasicBox'),h=id('sysBasicBox');if(b&&(!b.textContent||b.textContent==='Loading...')){try{let j=await getJson('/status');b.textContent=j.basicStatusText||'Status unavailable';if(h)h.textContent=j.basicSystemText||'System health unavailable'}catch(e){if(b)b.textContent='Status update failed: '+String(e)}}}</script>"));
   server.sendContent(F("<script>const _nscApplyStatusMode=applyStatusMode;applyStatusMode=function(){let a=id('statusAdvancedWrap'),b=id('statusBasicWrap'),btn=id('statusModeBtn');if(!a&&b){b.style.display='grid';return}_nscApplyStatusMode()};applyStatusMode();</script>"));
+  server.sendContent(F("<script>function installTooltipMarkers(){document.querySelectorAll('[title]').forEach(function(e){if(e.classList.contains('tipMarker')||e.dataset.tipMarker)return;let t=e.getAttribute('title');if(!t)return;let m=document.createElement('span');m.className='tipMarker';m.dataset.tooltip=t;m.title=t;m.tabIndex=0;m.setAttribute('role','img');m.setAttribute('aria-label','Help: '+t);m.textContent='?';e.dataset.tipMarker='1';e.insertAdjacentElement('afterend',m)})}window.addEventListener('load',function(){setTimeout(installTooltipMarkers,0)});</script>"));
+  server.sendContent(F("<script>window.addEventListener('load',function(){document.querySelectorAll('label span[title]').forEach(function(e){if(e.textContent.trim()!=='?')return;e.classList.add('tipMarker');e.dataset.tooltip=e.getAttribute('title');e.removeAttribute('style');let n=e.nextElementSibling;if(n&&n.classList.contains('tipMarker')&&n.dataset.tipMarker)n.remove()})});</script>"));
+  server.sendContent(F("<script>window.addEventListener('load',function(){let w=document.getElementById('btwait'),m=w&&w.previousElementSibling;if(!w||!m||!m.classList.contains('tipMarker'))return;let t=m.getAttribute('title')||m.dataset.tooltip||'';w.setAttribute('title',t);m.remove();if(typeof installTooltipMarkers==='function')installTooltipMarkers()});</script>"));
+  server.sendContent(F("<script>window.addEventListener('load',function(){let w=document.getElementById('btwait'),l=w&&w.parentElement&&w.parentElement.previousElementSibling,m=l&&l.querySelector('span.tipMarker');if(!w||!m)return;let t=m.getAttribute('title')||m.dataset.tooltip||'';w.setAttribute('title',t);m.remove();if(typeof installTooltipMarkers==='function')installTooltipMarkers()});</script>"));
+  server.sendContent(F("<script>window.addEventListener('load',function(){let w=document.getElementById('btwait'),l=w&&w.parentElement,m=l&&l.querySelector('label span[title]');if(!w||!m)return;let t=m.getAttribute('title')||m.dataset.tooltip||'';w.setAttribute('title',t);m.remove();if(typeof installTooltipMarkers==='function')installTooltipMarkers()});</script>"));
   server.sendContent(F("</div></body></html>"));
 #if defined(ESP32)
   // ESP32 WebServer needs the final zero-length chunk when CONTENT_LENGTH_UNKNOWN is used.
@@ -1238,6 +1222,37 @@ void sendStaticWebPage() {
     yield();
   }
 #endif
+}
+
+void handleWebHelpPage() {
+  // Keep this guide entirely local and stream it from flash so opening Help
+  // does not allocate another large page-sized String on the ESP32 heap.
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Connection", "close");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  server.sendContent(F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'><title>Nexstar5/8-Bridge Help</title><style>body{font-family:Arial,Helvetica,sans-serif;background:#0b1020;color:#edf2ff;margin:0;padding:12px;line-height:1.45}.wrap{max-width:900px;margin:auto}.top{background:#080d1a;border:1px solid #2b3654;border-radius:12px;padding:12px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px}.top h1{font-size:20px;margin:0}.btn{display:inline-block;border:1px solid #2b3654;border-radius:9px;background:#1b2742;color:#edf2ff;padding:8px 12px;text-decoration:none;font-weight:bold}.card{background:#151c2f;border:1px solid #2b3654;border-radius:12px;margin:10px 0;padding:12px 14px}details{background:#101729;border:1px solid #2b3654;border-radius:9px;margin:8px 0;padding:8px 10px}summary{cursor:pointer;font-weight:bold;color:#8dffba}code{background:#080d1a;border-radius:4px;padding:2px 4px;color:#ffe58a}li{margin:5px 0}.note{color:#a9b4cf;font-size:14px}</style></head><body><div class='wrap'><div class='top'><h1>"));
+  server.sendContent(FW_NAME);
+  server.sendContent(F(" "));
+  server.sendContent(FW_VERSION);
+  server.sendContent(F("</h1></div><div class='card'><p>This help is built into the firmware and works without Internet access. Use the sections below for setup, operation, and troubleshooting.</p>"));
+  server.sendContent(F("<style>.themeLight{background:#f3f5f8;color:#172033}.themeLight .top,.themeLight .card,.themeLight details{background:#fff;border-color:#bcc5d2}.themeLight .btn{background:#e5eaf1;color:#172033;border-color:#aab4c2}.themeLight summary{color:#1769aa}.themeLight code{background:#f8fafc;color:#174b80}.themeLight .note{color:#4b5668}.themeNight{background:#050000;color:#ff3a3a}.themeNight .top,.themeNight .card,.themeNight details{background:#100000;border-color:#5a0000}.themeNight .btn{background:#260000;color:#ff4a4a;border-color:#750000}.themeNight summary{color:#ff7070}.themeNight code{background:#050000;color:#ff7070}.themeNight .note{color:#ff3a3a}</style><script>document.body.className=localStorage.getItem('nightMode')==='1'?'themeNight':(localStorage.getItem('baseTheme')==='light'?'themeLight':'themeDark');</script>"));
+  server.sendContent(F("<details open><summary>Quick start</summary><ol><li>Connect the mount handset and successfully complete the normal alignment.</li><li>Start <b>RS-232 mode</b> from the handset before expecting mount communication.</li><li>Power the bridge. It listens for a Bluetooth client for the configured BT Wait period; if none connects, it starts full Wi-Fi mode.</li><li>In full Wi-Fi mode, join the configured STA network or the fallback AP, then open the displayed IP address.</li><li><b>If using AP mode, run GPS Sync from Setup.</b> It uses the browser to populate the bridge time and site location. Valid time and location are prerequisites for mount polling.</li><li>Check the Status tab for mount, time, location, and protocol state before sending a GOTO.</li></ol></details>"));
+  server.sendContent(F("<details><summary>Connections and operating modes</summary><ul><li><b>Bluetooth:</b> Classic Bluetooth is used by SkySafari. When a Bluetooth client connects during the startup window, the bridge remains Bluetooth-only until reset.</li><li><b>Full Wi-Fi:</b> Provides the Web UI, Telnet, SkySafari/LX200, Stellarium, and Alpaca services.</li><li><b>GPIO27:</b> Grounding the optional override pin selects Bluetooth-only startup.</li><li>Changing networks or using GPS Sync may require accepting the temporary HTTPS certificate in the browser.</li><li><b>D2 status LED:</b> Off means idle and healthy; solid means the Bluetooth startup window or an active client; a slow 100 ms pulse every 3 seconds indicates a mount fault; a normal 100 ms pulse every 1 second indicates a Wi-Fi fault; a fast 100 ms pulse every 300 ms indicates both.</li></ul></details>"));
+  server.sendContent(F("<details><summary>Web UI guide</summary><ul><li><b>Control:</b> Read cached mount coordinates, nudge, and submit safe GOTO commands.</li><li><b>Status:</b> Observer status and system health are refreshed from the local <code>/status</code> endpoint.</li><li><b>Setup:</b> Configure site/time, polling intervals, handshake timeout, NTP, Wi-Fi, and approximate location.</li><li><b>Logs:</b> Review recent firmware events. Logging and profiling consume resources; keep them at the lowest useful level during long unattended operation.</li><li><b>Catalog:</b> The catalog is loaded by the browser on demand and is not required for basic mount operation.</li></ul></details>"));
+  server.sendContent(F("<details><summary>Web UI features in detail</summary><ul><li><b>Theme and scale:</b> Red, Light, Dark, and the minus/plus scale controls change the local browser presentation and are remembered locally.</li><li><b>Control - Manual Nudge:</b> Select rate 1-4, then use Up, Down, Left, or Right. The bridge sends the corresponding mount movement command and prevents overlapping mount transactions.</li><li><b>Control - GOTO RA/Dec:</b> Enter RA in hours from 0 to less than 24 and Dec from -90 to +90 degrees. Load Current RA/Dec fills the cached mount position. Horizon and configured safety limits are checked before the GOTO is queued.</li><li><b>Control - GOTO Alt/Az:</b> Enter altitude from -90 to +90 degrees and azimuth from 0 to less than 360 degrees. Load Current Alt/Az fills the cached position. Horizon and altitude-limit checks run before the command is accepted.</li><li><b>Control - Catalog GOTO:</b> Search solar-system objects, deep-sky objects, galaxies, nebulae, clusters, bright stars, and BSC5 stars. Use visibility sorting and Nearby Object to find targets near the current pointing position. Slew to Object uses the same safety checks as manual GOTO.</li><li><b>Status - Basic:</b> Shows observer position, mount state, operation, response age, time, location, and computed Alt/Az. System Health shows heap, loop, Wi-Fi, and service information.</li><li><b>Status - Advanced:</b> Adds protocol counters, poll timing, cache ages, task information, diagnostics, and detailed network state. Use it for troubleshooting rather than routine operation.</li><li><b>Setup - Site / Time / Polling:</b> Saves latitude, longitude, UTC offset, date/time, active and idle poll intervals, handshake timeout, and client throttle. Active polling is used when a client demands position; idle polling is slower when no client is active.</li><li><b>Bluetooth startup wait:</b> The bridge listens for a Bluetooth client for the configured BT Wait period after reset. A client connection keeps Bluetooth-only mode; otherwise Full Wi-Fi starts automatically.</li><li><b>Setup - GPS Sync:</b> Opens the temporary local HTTPS time/location page. Accept its certificate warning if shown, then return to the HTTP UI.</li><li><b>Setup - NTP:</b> Enables NTP, sets the two time servers and time-zone/DST rule, and provides Sync NTP Now. STA Internet access is required for NTP.</li><li><b>Setup - Approx Internet Location:</b> Fetches city-level coordinates from public IP geolocation. Verify the result before using it for alignment; it is not a precision GPS source.</li><li><b>Setup - Safety and rates:</b> Saves altitude/declination limits and manual movement rates. Reset Rates restores the default movement-rate values.</li><li><b>Setup - Wi-Fi:</b> Saves STA credentials, AP settings, and provides clear/reset actions. A reboot may be required before a new network configuration is active.</li><li><b>Logs:</b> Select Errors, Warnings, Information, Debug, or Trace and choose log categories. Clear Logs removes stored entries; Clear Alert resets the visible alert. Verbose logging uses heap and CPU.</li></ul></details>"));
+  server.sendContent(F("<details><summary>Telnet console</summary><p>Connect to port <code>23</code>. Type <code>help</code> for commands including <code>status</code>, <code>health</code>, <code>get</code>, <code>goto</code>, <code>mountpoll</code>, and <code>reboot</code>.</p><p>The full-screen <code>menu</code> uses additional heap and may affect stability. Exit it with <code>q</code> when finished. The bridge will also release a closed or stalled Telnet session automatically.</p></details>"));
+  server.sendContent(F("<details><summary>Telnet commands in detail</summary><ul><li><b>Help:</b> <code>help</code>, <code>?</code>, <code>help mount</code>, <code>help mode</code>, <code>help wifi</code>, and <code>help &lt;command&gt;</code> show command-specific guidance.</li><li><b>Status:</b> <code>status</code> and <code>current_state</code> show observer/mount state; <code>system_health</code> shows system health; <code>telnet</code> shows Telnet state; <code>gpio_startup</code> shows startup-pin state.</li><li><b>Position:</b> <code>get</code> reads RA/Dec, <code>getaltaz</code> reads Alt/Az, and <code>goto radec &lt;hours&gt; &lt;degrees&gt;</code> or <code>goto altaz &lt;altitude&gt; &lt;azimuth&gt;</code> submits safe mount operations.</li><li><b>Motion:</b> <code>nudge az+</code>, <code>nudge az-</code>, <code>nudge alt+</code>, and <code>nudge alt-</code> move at the selected rate. <code>rates</code> displays rates.</li><li><b>Polling:</b> <code>mountpoll</code> displays the active interval; <code>mountpoll &lt;ms&gt;</code> changes it. <code>idlepoll &lt;ms&gt;</code> changes the idle interval. <code>handshake</code> displays the timeout; <code>handshake &lt;ms&gt;</code> changes it.</li><li><b>Mount diagnostics:</b> <code>testinit</code> tests initialization; <code>drain</code> discards pending UART bytes; <code>rawmount</code> and <code>rawgoto</code> run raw diagnostic cycles. These can interfere with normal mount traffic and should be used only while testing.</li><li><b>Wi-Fi and mode:</b> <code>wifi</code>, <code>wifi status</code>, <code>wifi on</code>, and <code>wifi off</code> report or control Wi-Fi runtime. <code>web</code> and <code>web status</code> report Web UI state. Startup mode selection is intentionally automatic; reset starts the Bluetooth window.</li><li><b>Diagnostics:</b> <code>profile</code>, <code>profile 0</code>, <code>profile 1</code>, <code>profile clear</code>, inspect optional diagnostics. Disable verbose logging/profiling during long-term operation.</li><li><b>Configuration:</b> <code>setsta &lt;ssid&gt; &lt;password&gt;</code> saves STA credentials; <code>apdefault</code> restores AP defaults; <code>log 0..5 [systems]</code> changes logging; <code>red</code> toggles Telnet text color.</li><li><b>Session:</b> <code>menu</code> enters the full-screen UI; <code>monitor [s|ms]</code> shows a live status monitor; <code>tasks [s|ms]</code> shows FreeRTOS task data; <code>telnetlog [0|1]</code> controls live log output. Use <code>q</code>, <code>exit</code>, or <code>quit</code> to leave an interactive view.</li><li><b>Restart:</b> <code>reboot</code> or <code>restart</code> restarts the controller. <code>clearlogs</code> clears stored log data when available through the command interface.</li></ul></details>"));
+  server.sendContent(F("<details><summary>Full-screen Telnet menu</summary><ul><li>Use Up/Down to navigate, Right or Enter to select, Left or <code>q</code> to go back, Tab to move focus, and <code>?</code> for contextual help.</li><li><b>Control:</b> Read RA/Dec, Read Alt/Az, Manual Nudge, GOTO RA/Dec, GOTO Alt/Az, Mount initialization test, and Drain mount input.</li><li><b>Status:</b> Observer/System Basic and Advanced views, Network Status, Time/Location, Protocols/Ports, and FreeRTOS Tasks.</li><li><b>Setup:</b> Active and idle polling, status refresh interval, Telnet live logging, and links to Web UI time, NTP, and safety settings.</li><li><b>Logs:</b> Errors-only through Trace levels and live Telnet log toggle.</li><li><b>Advanced:</b> GPIO startup pins, Telnet status, controller restart, and AP-default restore.</li><li>The menu uses extra heap and screen output. A slow or abandoned client is released automatically, but closing the menu with <code>q</code> is preferred.</li></ul></details>"));
+  server.sendContent(F("<details><summary>Mount communication and recovery</summary><ul><li>The mount is strictly single-command: a new command is not sent while another is active.</li><li>The bridge sends the NexStar <code>?</code> handshake and expects <code>#</code> before applicable commands; <code>@</code> marks command completion.</li><li>During a GOTO, position polling is suspended and cached/estimated coordinates are reported.</li><li>Odd UART bytes are discarded while waiting for the expected protocol marker. A failed handshake causes a bounded recovery pause before polling resumes.</li><li>If the mount is not responding, verify handset RS-232 mode, cable orientation, serial-converter switch settings, power, and the ESP32 UART wiring before changing timeouts.</li></ul></details>"));
+  server.sendContent(F("<details><summary>Stability checklist</summary><ul><li>Keep the mount polling intervals conservative.</li><li>Avoid leaving the Telnet full-screen menu open during heavy SkySafari or Web UI activity.</li><li>Use the Status and Logs tabs to check free heap and minimum heap, but disable verbose diagnostics for long-term operation.</li><li>If Wi-Fi becomes sluggish, close Telnet sessions, stop repeated browser refreshes, and allow any active mount transaction to finish.</li><li>Do not start a second mount command while a GOTO or other command is active.</li></ul></details>"));
+  server.sendContent(F("<details><summary>Useful local endpoints</summary><ul><li><code>/</code> - Web UI</li><li><code>/help</code> - this offline guide</li><li><code>/status</code> - machine-readable status JSON</li><li><code>/status_text</code> - plain-text observer status</li><li><code>/sys_text</code> - plain-text system health</li><li><code>/logs</code> - recent local log output</li></ul></details>"));
+  server.sendContent(F("<details><summary>Online documentation</summary><p>These links are optional and require Internet access:</p><ul><li><a target='_blank' rel='noopener' href='https://github.com/gumby2/nexstar-protocol-converter-esp32-chatgpt'>GitHub repository</a></li><li><a target='_blank' rel='noopener' href='https://github.com/gumby2/nexstar-protocol-converter-esp32-chatgpt/blob/main/README.md'>README and quick start</a></li><li><a target='_blank' rel='noopener' href='https://github.com/gumby2/nexstar-protocol-converter-esp32-chatgpt/blob/main/docs/architecture.md'>Architecture</a></li><li><a target='_blank' rel='noopener' href='https://github.com/gumby2/nexstar-protocol-converter-esp32-chatgpt/blob/main/docs/protocol.md'>Mount protocol</a></li><li><a target='_blank' rel='noopener' href='https://github.com/gumby2/nexstar-protocol-converter-esp32-chatgpt/blob/main/docs/recovery_runbook.md'>Recovery runbook</a></li><li><a target='_blank' rel='noopener' href='https://github.com/gumby2/nexstar-protocol-converter-esp32-chatgpt/blob/main/docs/web_endpoints.md'>Web endpoints</a></li><li><a target='_blank' rel='noopener' href='https://github.com/gumby2/nexstar-protocol-converter-esp32-chatgpt/blob/main/docs/console_help.md'>Console help</a></li></ul></details><p class='note'>Firmware: "));
+  server.sendContent(FW_NAME);
+  server.sendContent(F(" "));
+  server.sendContent(FW_VERSION);
+  server.sendContent(F("</p></div></div></body></html>"));
+  server.sendContent("");
 }
 
 void handleLogsPage() {
@@ -1298,6 +1313,7 @@ void handleBtStatusPage() {
   json += "\"pollIntervalMs\":" + String(pollIntervalMs) + ",";
   json += "\"idlePollIntervalMs\":" + String(idlePollIntervalMs) + ",";
   json += "\"handshakeTimeoutMs\":" + String(mountHandshakeTimeoutMs) + ",";
+  json += "\"btWaitSeconds\":" + String(btWaitSeconds) + ",";
   json += "\"freeHeap\":" + String(ESP.getFreeHeap());
   json += "}";
   sendNoCacheHeaders();
@@ -1309,75 +1325,6 @@ void handleStatusPage() {
   logHttpRequest("STATUS");
   if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
     handleBtStatusPage();
-    return;
-  }
-  if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
-    bool btConnected = false;
-#if HAS_CLASSIC_BT
-    btConnected = bluetoothClientConnected();
-#endif
-    int dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond;
-    currentLocalParts(dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond);
-
-    String json;
-    json.reserve(1200);
-    json += "{";
-    json += "\"board\":\"" + String(BOARD_NAME) + "\",";
-    json += "\"bridgeMode\":\"" + jsonEscape(String(bridgeModeName())) + "\",";
-    json += "\"apIp\":\"" + WiFi.softAPIP().toString() + "\",";
-    json += "\"staIp\":\"" + WiFi.localIP().toString() + "\",";
-    json += "\"lastStaIp\":\"" + jsonEscape(lastStaIp) + "\",";
-    json += "\"staConnected\":" + String((staConnected && WiFi.status() == WL_CONNECTED) ? "true" : "false") + ",";
-    json += "\"webPort\":" + String(HTTP_WEB_PORT) + ",";
-    json += "\"alpacaPort\":0,";
-    json += "\"alpacaDiscoveryPort\":0,";
-    json += "\"lx200Port\":0,";
-    json += "\"stellariumPort\":0,";
-    json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeIsEnabled() ? "true" : "false") + ",";
-    json += "\"bluetoothConnected\":" + String(btConnected ? "true" : "false") + ",";
-    json += "\"coexPreference\":\"" + jsonEscape(bluetoothCoexPreferenceText()) + "\",";
-    json += "\"coexPreferenceResult\":" + String(bluetoothCoexPreferenceResult()) + ",";
-    json += "\"lx200BtRxCommands\":" + String(lx200BtRxCommands) + ",";
-    json += "\"lx200BtTxReplies\":" + String(lx200BtTxReplies) + ",";
-    json += "\"lx200BtUnhandled\":" + String(lx200BtUnhandledCommands) + ",";
-  json += "\"lx200CommonRouterCommands\":" + String(lx200CommonRouterCommands) + ",";
-    json += "\"lx200BtLastCommand\":\"" + jsonEscape(lx200BtLastCommand) + "\",";
-    json += "\"lx200BtLastReply\":\"" + jsonEscape(lx200BtLastReply) + "\",";
-    json += "\"lx200BtLastUnhandled\":\"" + jsonEscape(lx200BtLastUnhandled) + "\",";
-    json += "\"timeValid\":" + String(timeValid ? "true" : "false") + ",";
-    json += "\"timeSource\":\"" + jsonEscape(String(timeSourceName(currentTimeSource))) + "\",";
-    json += "\"localYear\":" + String(dispYear) + ",";
-    json += "\"localMonth\":" + String(dispMonth) + ",";
-    json += "\"localDay\":" + String(dispDay) + ",";
-    json += "\"localHour\":" + String(dispHour) + ",";
-    json += "\"localMinute\":" + String(dispMinute) + ",";
-    json += "\"localSecond\":" + String(dispSecond) + ",";
-    json += "\"utcOffsetMinutes\":" + String(utcOffsetMinutes) + ",";
-    json += "\"timeZoneLabel\":\"" + jsonEscape(currentTimezoneAbbrev()) + "\",";
-    json += "\"siteValid\":" + String(siteValid ? "true" : "false") + ",";
-    json += "\"locationSource\":\"" + jsonEscape(currentLocationSource) + "\",";
-    json += "\"latitude\":" + String(siteLatitudeDeg, 6) + ",";
-    json += "\"longitude\":" + String(siteLongitudeDeg, 6) + ",";
-    json += "\"mountBusy\":" + String(mountBusy ? "true" : "false") + ",";
-    json += "\"mountCommFault\":" + String(mountCommFault ? "true" : "false") + ",";
-    json += "\"cacheValid\":" + String(mountCurrentRaDecValid ? "true" : "false") + ",";
-    json += "\"raDeg\":" + String(mountCurrentRA_deg, 6) + ",";
-    json += "\"decDeg\":" + String(mountCurrentDec_deg, 6) + ",";
-    json += "\"raHours\":" + String(mountCurrentRA_deg / 15.0, 6) + ",";
-    json += "\"altAzCacheValid\":" + String(mountCurrentAltAzValid ? "true" : "false") + ",";
-    json += "\"altDeg\":" + String(mountCurrentAlt_deg, 6) + ",";
-    json += "\"azDeg\":" + String(mountCurrentAz_deg, 6) + ",";
-    json += "\"mountCurrentRaDecAgeMs\":" + String(mountCurrentRaDecValid ? millis() - mountCurrentRaDecMs : 0) + ",";
-    json += "\"mountCurrentAltAzAgeMs\":" + String(mountCurrentAltAzValid ? millis() - mountCurrentAltAzMs : 0) + ",";
-    json += "\"pollIntervalMs\":" + String(pollIntervalMs) + ",";
-    json += "\"idlePollIntervalMs\":" + String(idlePollIntervalMs) + ",";
-    json += "\"handshakeTimeoutMs\":" + String(mountHandshakeTimeoutMs) + ",";
-    json += "\"btPostGotoFastPoll\":" + String((lastGotoAcceptedMs && millis() - lastGotoAcceptedMs < BT_POST_GOTO_FAST_POLL_WINDOW_MS) ? "true" : "false") + ",";
-    json += "\"freeHeap\":" + String(ESP.getFreeHeap());
-    json += "}";
-    sendNoCacheHeaders();
-    server.sendHeader("Connection", "close");
-    server.send(200, "application/json", json);
     return;
   }
   // Status pages do not directly poll the mount. Current-position fields are
@@ -1392,11 +1339,11 @@ void handleStatusPage() {
   int dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond;
   currentLocalParts(dispYear, dispMonth, dispDay, dispHour, dispMinute, dispSecond);
 
-  String st = currentStateText();
-  String sys = systemHealthText();
-
   String json;
-  json.reserve(5000);
+  // The current status schema is approximately 7.4 KB. Reserve enough space
+  // for the normal response so String growth does not repeatedly reallocate
+  // and fragment the heap during the browser's periodic refresh.
+  json.reserve(8000);
   json += "{";
   json += "\"board\":\"" + String(BOARD_NAME) + "\",";
   json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
@@ -1454,7 +1401,7 @@ void handleStatusPage() {
   json += "\"httpServicedCount\":" + String(httpServicedCount) + ",";
   json += "\"httpSkippedForSkySafari\":" + String(httpSkippedForSkySafari) + ",";
   json += "\"bridgeMode\":\"" + jsonEscape(String(bridgeModeName())) + "\",";
-  json += "\"bridgeModeValue\":\"" + String(bridgeMode == BRIDGE_MODE_BT_MIN_WEB ? "bt" : (bridgeMode == BRIDGE_MODE_WIFI_SERVERS ? "wifi-noweb" : (bridgeMode == BRIDGE_MODE_WEB_ONLY ? "web" : "wifi"))) + "\",";
+  json += "\"bridgeModeValue\":\"" + String(bridgeMode == BRIDGE_MODE_BT_MIN_WEB ? "bt" : "wifi") + "\",";
   json += "\"bluetoothEnabled\":" + String(bluetoothRuntimeIsEnabled() ? "true" : "false") + ",";
   json += "\"bluetoothConnected\":" + String(btConnected ? "true" : "false") + ",";
   json += "\"logLevel\":" + String(LOG_LEVEL) + ",";
@@ -1484,6 +1431,7 @@ void handleStatusPage() {
   json += "\"pollIntervalMs\":" + String(pollIntervalMs) + ",";
   json += "\"idlePollIntervalMs\":" + String(idlePollIntervalMs) + ",";
   json += "\"handshakeTimeoutMs\":" + String(mountHandshakeTimeoutMs) + ",";
+  json += "\"btWaitSeconds\":" + String(btWaitSeconds) + ",";
   json += "\"effectivePollIntervalMs\":" + String(effectiveMountPollIntervalMs()) + ",";
   json += "\"positionDemandActive\":" + String(positionDemandActive() ? "true" : "false") + ",";
   json += "\"btPostGotoFastPoll\":" + String((bridgeMode == BRIDGE_MODE_BT_MIN_WEB && lastGotoAcceptedMs && millis() - lastGotoAcceptedMs < BT_POST_GOTO_FAST_POLL_WINDOW_MS) ? "true" : "false") + ",";
@@ -1527,9 +1475,9 @@ void handleStatusPage() {
   json += "\"safeAltLimitEnabled\":" + String(safeAltLimitEnabled ? "true" : "false") + ",";
   json += "\"safeAltMinDeg\":" + String(safeAltMinDeg, 3) + ",";
   json += "\"safeAltMaxDeg\":" + String(safeAltMaxDeg, 3) + ",";
-  json += "\"basicStatusText\":\"" + jsonEscape(basicStatusText()) + "\",";
-  json += "\"basicSystemText\":\"" + jsonEscape(basicSystemHealthText()) + "\",";
-  json += "\"statusText\":\"" + jsonEscape(st) + "\",";
+  appendJsonEscapedField(json, "basicStatusText", basicStatusText());
+  appendJsonEscapedField(json, "basicSystemText", basicSystemHealthText());
+  appendJsonEscapedField(json, "statusText", currentStateText());
   json += "\"uptime\":\"" + jsonEscape(formatUptime()) + "\",";
   json += "\"cpuLoad\":\"" + jsonEscape(sampleWebCpuLoadText()) + "\",";
   json += "\"loopLatencyCurrentMs\":" + String(lastLoopLatencyMs) + ",";
@@ -1541,7 +1489,7 @@ void handleStatusPage() {
 #if !defined(NEXSTAR_DIAGNOSTIC_LIGHT)
   json += profilerJson() + ",";
 #endif
-  json += "\"systemText\":\"" + jsonEscape(sys) + "\"";
+  appendJsonEscapedField(json, "systemText", systemHealthText(), false);
   json += "}";
   sendNoCacheHeaders();
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1598,6 +1546,12 @@ void handleSetSiteTimePage() {
     if (t < 250) t = 250;
     if (t > 60000) t = 60000;
     minClientPollIntervalMs = (unsigned long)t;
+  }
+  if (server.hasArg("btwait")) {
+    long w = server.arg("btwait").toInt();
+    if (w < 10) w = 10;
+    if (w > 300) w = 300;
+    btWaitSeconds = (uint16_t)w;
   }
 
   computeAltAzFromRaDec();
@@ -1663,6 +1617,12 @@ void handleSetManualSiteTimePage() {
     if (t < 250) t = 250;
     if (t > 60000) t = 60000;
     minClientPollIntervalMs = (unsigned long)t;
+  }
+  if (server.hasArg("btwait")) {
+    long w = server.arg("btwait").toInt();
+    if (w < 10) w = 10;
+    if (w > 300) w = 300;
+    btWaitSeconds = (uint16_t)w;
   }
 
   computeAltAzFromRaDec();
@@ -1743,6 +1703,12 @@ void handleSetDeviceSiteTimePage() {
     if (t < 250) t = 250;
     if (t > 60000) t = 60000;
     minClientPollIntervalMs = (unsigned long)t;
+  }
+  if (server.hasArg("btwait")) {
+    long w = server.arg("btwait").toInt();
+    if (w < 10) w = 10;
+    if (w > 300) w = 300;
+    btWaitSeconds = (uint16_t)w;
   }
 
   computeAltAzFromRaDec();
@@ -1966,20 +1932,16 @@ void handleFetchIpLocationPage() {
   logHttpRequest("FETCH_IP_LOCATION");
   LOG_SET_I("Setup button pressed: Get Approx Internet Location");
   LOG_TIME_I("Web requested approximate internet location fetch");
-  bool ok = fetchApproxLocationFromInternet();
-
-  String msg;
-  if (ok) {
-    msg = "Approx location fetched: " + String(approxIpLatitudeDeg, 6) + ", " + String(approxIpLongitudeDeg, 6);
-    if (approxIpLocationText.length()) msg += " (" + approxIpLocationText + ")";
-  } else {
-    msg = approxIpLocationStatus;
-  }
-
+  bool staReady = staConnected && WiFi.status() == WL_CONNECTED;
   if (wantsAjax()) {
-    if (ok) sendAjaxOK(msg);
-    else sendAjaxFail(msg);
+    if (!staReady) {
+      sendAjaxFail("STA WiFi is not connected");
+    } else {
+      requestExplicitApproxLocation();
+      sendAjaxOK("Approx location lookup queued");
+    }
   } else {
+    if (staReady) requestExplicitApproxLocation();
     server.sendHeader("Location", "/");
     server.send(302, "text/plain", "Redirecting");
   }
@@ -2456,7 +2418,7 @@ void sendMinimalWebPage() {
   page += htmlEscape(lx200BtLastUnhandled.length() ? lx200BtLastUnhandled : String("none"));
   page += F("</span><br><b>Mount poll:</b> <span id='pollms'>");
   page += pollIntervalMs == 0 ? String("off") : String(pollIntervalMs) + " ms";
-  page += F("</span><br><span id='live' class='small'>loading live status...</span></div><div class='box'><a class='btn' href='/mode?radio=wifi'>WiFi</a>");
+  page += F("</span><br><span id='live' class='small'>loading live status...</span></div><div class='box'>");
   page += F("<button onclick=\"location.reload()\">Refresh</button></div>");
   page += F("<div class='box'><h3>Status</h3>");
   page += F("Time: ");
@@ -2968,7 +2930,6 @@ void telnetPrintHelp(Print &out) {
   out.println("  current_state | currentstate | state | pos");
   out.println("  system_health | systemhealth | health");
   out.println("  profile | profile 0 | profile 1 | profile clear");
-  out.println("  crashdump");
   out.println("  gpio_startup");
   out.println("  telnet");
   out.println("Mount:");
@@ -2981,7 +2942,6 @@ void telnetPrintHelp(Print &out) {
   out.println("  nudge az+ | nudge az- | nudge alt+ | nudge alt-");
   out.println("Mode:");
   out.println("  mode");
-  out.println("  mode bt | mode wifi | mode wifi noweb | mode web");
   out.println("  web | web status");
   out.println("  wifi | wifi status | wifi on | wifi off");
   out.println("  reboot | restart | exit | quit");
@@ -3110,55 +3070,9 @@ void telnetPrintStatus(Print &out) {
   }
 
   out.println();
-  out.println("=== Status ===");
-  out.printf("Firmware: %s %s\n", FW_NAME, FW_VERSION);
-  out.printf("Bridge mode: %s\n", bridgeModeName());
-  out.printf("Startup mode source: %s\n", startupModeSource.c_str());
-  out.printf("Startup mode pin used: %d\n", startupModePinUsed);
-  out.printf("WiFi mode: %s\n", wifiModeText.c_str());
-  out.printf("WiFi status: %s\n", lastWifiStatus.c_str());
-  out.printf("AP SSID: %s\n", runtimeApSsid().c_str());
-  out.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-  out.printf("STA SSID: %s\n", staSsid.c_str());
-  out.printf("STA IP: %s\n", WiFi.localIP().toString().c_str());
-  out.printf("Telnet port: %u\n", TELNET_PORT);
-  out.printf("Telnet password: %s\n", telnetMaskedPassword().c_str());
-  out.printf("Telnet authenticated: %s\n", telnetAuthenticated ? "yes" : "no");
-  out.printf("Telnet live logs: %s lines=%lu\n", telnetLiveLogEnabled ? "enabled" : "disabled", (unsigned long)telnetLiveLogLines);
-  out.printf("GOTO queue: active=%s type=%s timeout=%lu ms effective=%lu ms accepted=%lu started=%lu timedOut=%lu replaced=%lu immediateAcks=%lu cachedPositionReplies=%lu\n",
-             hasQueuedGoto() ? "yes" : "no",
-             queuedGotoTypeName(queuedGotoType),
-             gotoQueueTimeoutMs,
-             effectiveGotoQueueTimeoutMs(),
-             (unsigned long)gotoQueueAccepted,
-             (unsigned long)gotoQueueStarted,
-             (unsigned long)gotoQueueTimedOut,
-             (unsigned long)gotoQueueReplaced,
-             (unsigned long)gotoQueueImmediateAcks,
-             (unsigned long)queuedGotoPositionCacheReplies);
-  out.printf("Mount poll interval=%lu ms legacyIdle=%lu ms lastPollAge=%lu ms schedulerLatency=%lu/%lu ms started=%lu deferredBusy=%lu missedDeadline=%lu\n",
-             pollIntervalMs,
-             idlePollIntervalMs,
-             lastMountPollMs == 0 ? 0UL : (unsigned long)(millis() - lastMountPollMs),
-             lastPollSchedulerLatencyMs,
-             maxPollSchedulerLatencyMs,
-             mountPollsStarted,
-             mountPollsDeferredBusy,
-             mountPollsMissedDeadline);
-  out.printf("Loop latency current/max=%lu/%lu ms\n", lastLoopLatencyMs, maxLoopLatencyMs);
-  out.printf("WiFi runtime: %s\n", wifiRuntimeEnabled ? "enabled" : "disabled");
-  out.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
-#if defined(ESP32)
-  out.printf("Min free heap: %u bytes\n", espMinFreeHeapCompat());
-#endif
-#if HAS_CLASSIC_BT
-  out.printf("Bluetooth runtime: %s\n", bluetoothRuntimeIsEnabled() ? "enabled" : "disabled");
-  out.printf("Bluetooth client: %s\n", bluetoothClientConnected() ? "connected" : "not connected");
-#endif
-  out.printf("Mount alive: %s\n", mountAlive() ? "yes" : "unknown/no recent response");
-  out.printf("Mount fault: %s\n", mountCommFault ? "yes" : "no");
-  if (lastMountFault.length()) out.printf("Last mount fault: %s\n", lastMountFault.c_str());
-  out.println("=== End Status ===");
+  out.println("=== Observer Status ===");
+  printBasicStatusText(out);
+  out.println("=== End Observer Status ===");
 }
 
 
@@ -3312,11 +3226,8 @@ void telnetRunCommand(String line, Print &out) {
       out.println("  drain                       Drain pending mount serial bytes.");
     } else if (topic == "mode" || topic == "boot" || topic == "runtime" || topic == "radio") {
       out.println("Mode and runtime commands:");
-      out.println("  mode                        Show current mode and active services.");
-      out.println("  mode bt                     Bluetooth + WiFi Telnet; no Web/protocol servers.");
-      out.println("  mode wifi                   Web UI + Telnet + SkySafari + Alpaca + Stellarium.");
-      out.println("  mode wifi noweb             Telnet + SkySafari + Alpaca + Stellarium; no Web UI.");
-      out.println("  mode web                    Web UI + Telnet only; no SkySafari/Alpaca/Stellarium.");
+      out.println("  mode                        Show current services and the fixed startup policy.");
+      out.println("  Startup mode is fixed: reset opens Bluetooth for the configured BT Wait period, then Full WiFi unless Bluetooth connects or GPIO27 is grounded.");
       out.println("  reboot | restart            Restart immediately.");
     } else if (topic == "wifi" || topic == "network") {
       out.println("WiFi configuration commands:");
@@ -3338,7 +3249,7 @@ void telnetRunCommand(String line, Print &out) {
       out.println("  5 trace  Very chatty low-level flow; use briefly, can flood logs.");
     } else if (topic == "web" || topic == "webserver") {
       out.println("web | web status | webserver | webserver status");
-      out.println("  Show Web UI state. Use mode commands to change saved Web UI behavior.");
+      out.println("  Show Web UI state and the active startup policy.");
     } else if (topic == "reboot" || topic == "restart") {
       out.println("reboot | restart");
       out.println("  Restart the controller immediately and close Telnet.");
@@ -3366,22 +3277,6 @@ void telnetRunCommand(String line, Print &out) {
     } else if (topic == "profile" || topic == "profiler") {
       out.println("profile | profile 0 | profile 1 | profile clear");
       out.println("  Show, disable/enable, or clear service timing counters.");
-    } else if (topic == "crashdump") {
-      out.println("crashdump");
-      out.println("  Show the last recorded firmware activities.");
-      out.println("  Automatically printed at boot when previous entries survived reset.");
-      out.println("  Useful after watchdog/crash resets to see what began or completed last.");
-      out.println("crashdump live");
-      out.println("  Show current heartbeat and service liveness ages.");
-      out.println("Columns:");
-      out.println("  ms      milliseconds since that boot");
-      out.println("  core    CPU core that wrote the entry");
-      out.println("  heap    free heap at the entry");
-      out.println("  largest largest free heap block at the entry");
-      out.println("  event   begin, end, or boot");
-      out.println("  detail  firmware section name");
-      out.println("If the newest previous entry is 'begin <section>' with no matching end,");
-      out.println("the reset/freeze probably happened inside that section.");
     } else if (topic == "tasks") {
       out.println("tasks");
       if (telnetFullUiAllowed()) {
@@ -3394,7 +3289,7 @@ void telnetRunCommand(String line, Print &out) {
       }
     } else if (topic == "gpio_startup") {
       out.println("gpio_startup");
-      out.println("  Show startup GPIO override state, selected pin, pin priority, and the mode each pin forces.");
+      out.println("  Show startup GPIO override state and whether GPIO27 forces Bluetooth-only startup.");
     } else if (topic == "telnet") {
       out.println("telnet");
       out.println("  Show Telnet state, port, client, authentication, and counters.");
@@ -3440,7 +3335,7 @@ void telnetRunCommand(String line, Print &out) {
       out.print("Unknown help topic: "); out.println(topic);
       out.println("Grouped topics: mount, mode, wifi");
       out.println("Specific topics: log, web, reboot, testinit, get, getaltaz, rates,");
-      out.println("mountpoll, handshake, profile, crashdump, nudge, idlepoll, drain, pos, health, gpio_startup, telnet, red,");
+      out.println("mountpoll, handshake, profile, nudge, idlepoll, drain, pos, health, gpio_startup, telnet, red,");
       out.println("setsta, apdefault");
     }
   }
@@ -3496,12 +3391,6 @@ void telnetRunCommand(String line, Print &out) {
   }
   else if (cmd == "profile" || cmd == "profiler") {
     profilerPrint(out);
-  }
-  else if (cmd == "crashdump live") {
-    crashdumpPrintLive(out);
-  }
-  else if (cmd == "crashdump") {
-    crashdumpPrint(out);
   }
   else if (cmd == "profile clear" || cmd == "profiler clear") {
     profilerReset();
@@ -3574,7 +3463,7 @@ void telnetRunCommand(String line, Print &out) {
   }
   else if (cmd == "web" || cmd == "web status" || cmd == "webserver" || cmd == "webserver status") {
     out.printf("Web UI: %s\n", bridgeModeHasWebUi() ? "listening" : "disabled");
-    out.println("Use mode wifi, mode wifi noweb, mode web, or mode bt to change saved Web UI behavior.");
+    out.println("Startup mode is fixed: reset opens the Bluetooth window, then enters Full WiFi unless Bluetooth connects or GPIO27 is grounded.");
   }
   else if (cmd == "wifi" || cmd == "wifi status") {
     out.printf("WiFi runtime: %s\n", wifiRuntimeEnabled ? "enabled" : "disabled");
@@ -3801,31 +3690,8 @@ void telnetRunCommand(String line, Print &out) {
   else if (cmd == "mode") {
     telnetPrintModeStatus(out);
   }
-  else if (cmd == "mode bt") {
-    out.println("WARNING: BT mode has Bluetooth + WiFi Telnet only; Web UI and WiFi protocol servers are disabled.");
-    out.println("The controller will restart and disconnect this Telnet session.");
-    saveBluetoothLiteWebBootEnabled(false);
-    saveBridgeMode(BRIDGE_MODE_BT_MIN_WEB);
-    scheduleRestart("telnet mode bt");
-    out.println("Saved BT + WiFi Telnet mode; restarting soon.");
-  }
-  else if (cmd == "mode wifi") {
-    out.println("WARNING: mode wifi schedules a restart and will disconnect this Telnet session.");
-    saveBridgeMode(BRIDGE_MODE_WIFI_FULL);
-    scheduleRestart("telnet mode wifi");
-    out.println("Saved full WiFi web mode; restarting soon.");
-  }
-  else if (cmd == "mode wifi noweb") {
-    out.println("WARNING: mode wifi noweb schedules a restart and will disconnect this Telnet session.");
-    saveBridgeMode(BRIDGE_MODE_WIFI_SERVERS);
-    scheduleRestart("telnet mode wifi noweb");
-    out.println("Saved WiFi protocol-server mode with browser Web UI disabled; restarting soon.");
-  }
-  else if (cmd == "mode web") {
-    out.println("WARNING: mode web schedules a restart and will disconnect this Telnet session.");
-    saveBridgeMode(BRIDGE_MODE_WEB_ONLY);
-    scheduleRestart("telnet mode web");
-    out.println("Saved Web UI only mode; SkySafari, Alpaca, and Stellarium will be disabled.");
+  else if (cmd == "mode bt" || cmd == "mode wifi" || cmd == "mode wifi noweb" || cmd == "mode web") {
+    out.println("Startup mode selection was removed. Reset starts the 60-second Bluetooth window; GPIO27 grounded forces Bluetooth-only.");
   }
   else if (cmd == "telnetlog") {
     Serial.println("Telnet live logging is disabled in BT Telnet mode.");
@@ -3992,14 +3858,12 @@ delay(500);
 
   Serial.println();
   Serial.printf("%s %s\n", FW_NAME, FW_VERSION);
-  crashdumpBegin();
 #if defined(ESP32)
   heartbeatLedBegin();
-  Serial.printf("[BOOT] heartbeat LED: %s GPIO%d active_%s interval=%lums\n",
+  Serial.printf("[BOOT] status LED: %s GPIO%d active_%s; off=idle solid=wait/client slow=mount normal=WiFi fast=combined fault\n",
                 HEARTBEAT_LED_ENABLED ? "enabled" : "disabled",
                 HEARTBEAT_LED_PIN,
-                HEARTBEAT_LED_ACTIVE_LOW ? "low" : "high",
-                (unsigned long)HEARTBEAT_INTERVAL_MS);
+                HEARTBEAT_LED_ACTIVE_LOW ? "low" : "high");
   Serial.println("ESP32/WROOM build: HardwareSerial UART2 on GPIO16/GPIO17; Stellarium receive-buffer fix active");
 #endif
   Serial.printf("Board: %s\n", BOARD_NAME);
@@ -4015,21 +3879,7 @@ delay(500);
   if (!loadPersistentSettings()) {
     Serial.println("[NVS] No saved NVS settings; using defaults");
   }
-  if (ESP32_BOOT_DISABLE_BACKGROUND_POLLING) {
-    pollIntervalMs = 0;
-    resetMountPollScheduler();
-    Serial.println("[BOOT] ESP32 background mount polling disabled at boot");
-  }
-  if (!ESP32_BOOT_DISABLE_BACKGROUND_POLLING) {
-    Serial.printf("[BOOT] ESP32 background mount polling loaded at %lu ms\n", pollIntervalMs);
-  }
-  if (ESP32_BOOT_AP_ONLY) {
-    ntpEnabled = false;
-    staConfigured = false;
-    staSsid = "";
-    staPass = "";
-    Serial.println("[BOOT] ESP32 AP-only boot: STA credentials cleared and NTP disabled for this boot");
-  }
+  Serial.printf("[BOOT] ESP32 background mount polling loaded at %lu ms\n", pollIntervalMs);
 #else
   {
     if (!LittleFS.begin()) {
@@ -4044,33 +3894,35 @@ delay(500);
 #endif
 
   Serial.println("[BOOT] network/mode setup begin");
-  loadBridgeMode();
+  // Startup mode is not persisted. Every normal boot begins with the
+  // Bluetooth discovery window and then enters Full WiFi; GPIO27 may force
+  // Bluetooth-only operation until reset.
+  bridgeMode = BRIDGE_MODE_WIFI_FULL;
   loadFirmwareLoggingEnabled();
   applyGpioStartupModeOverride();
   Serial.printf("[BOOT] bridge mode: %s source=%s pin=%d\n", bridgeModeName(), startupModeSource.c_str(), startupModePinUsed);
   if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
     ntpEnabled = false;
-    loadBluetoothLitePollInterval();
     if (pollIntervalMs > 60000) pollIntervalMs = 2000;
     resetMountPollScheduler();
     resetMountPollFailures();
 #if defined(ESP32)
-    loadWiFiConfig(); // use saved STA/AP settings in exclusive STA-only or AP-only mode, but do not start the full WebServer.h UI
+    wifiRuntimeEnabled = false;
+    staConnected = false;
+    apRunning = false;
     WiFi.persistent(false);
     WiFi.disconnect(true, true);
     WiFi.softAPdisconnect(true);
-    delay(150);
-    staRuntimeDisabled = false; // BT should use saved STA when configured, not force AP-only
-    setupWiFiFromSavedConfig();
-    // BT mode is intentionally Telnet-only. Never start the tiny web server.
+    WiFi.mode(WIFI_OFF);
     btLiteBootWebEnabled = false;
     setBluetoothTinyWebRuntimeEnabled(false);
-    Serial.println("[BT_MIN] Telnet-only BT boot; all web servers disabled");
-    startTelnetConsoleServer("BT Telnet-only boot");
+    wifiModeText = "BT only; WiFi disabled";
+    lastWifiStatus = "BT-only test boot; WiFi radio and services disabled";
+    Serial.println("[BT_MIN] BT-only test boot; WiFi radio, web, and Telnet disabled");
 #endif
-    wifiModeText = String("BT Telnet-only WiFi + ") + wifiModeText;
-    lastWifiStatus = String("BT Telnet-only: all web servers disabled on saved WiFi mode. ") + lastWifiStatus;
-    Serial.printf("[BOOT] BT: Telnet-only, all web servers disabled, NTP disabled in BT mode, independent interval-only mount polling enabled at %lu ms\n", pollIntervalMs);
+    wifiModeText = String("BT only + ") + wifiModeText;
+    lastWifiStatus = String("BT-only: WiFi radio and services disabled. ") + lastWifiStatus;
+    Serial.printf("[BOOT] BT: WiFi disabled, all web/protocol/Telnet services disabled, NTP disabled, interval-only mount polling enabled at %lu ms\n", pollIntervalMs);
   } else {
     setupWiFiFromSavedConfig();
   }
@@ -4093,23 +3945,54 @@ delay(500);
     Serial.printf("Stellarium TCP port: %u\n", STELLARIUM_PORT);
     Serial.printf("Telnet console port: %u\n", TELNET_PORT);
     Serial.printf("Alpaca UDP discovery port: %u\n", ALPACA_DISCOVERY_PORT);
-  } else if (bridgeMode == BRIDGE_MODE_WEB_ONLY) {
-    Serial.printf("Telnet console port: %u\n", TELNET_PORT);
-    Serial.println("Web-only mode: SkySafari WiFi, Alpaca, Stellarium, and Alpaca discovery disabled");
   } else {
     Serial.println("Bluetooth minimal mode: Alpaca, Stellarium, SkySafari WiFi, and Alpaca discovery disabled; Telnet console enabled if WiFi is on");
   }
 
 #if defined(ESP32)
-  setupBluetoothService(ESP32_BOOT_WEB_ONLY || bridgeModeHasWebUi() || bridgeModeHasWifiProtocols());
+  setupBluetoothService(bridgeModeHasWebUi() || bridgeModeHasWifiProtocols());
 #else
   setupBluetoothService(false);
+#endif
+
+#if defined(ESP32)
+  if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB && bluetoothRuntimeIsEnabled()) {
+    if (startupBtForcedByGpio) {
+      Serial.println("[BT_BOOT] GPIO27 grounded; Bluetooth-only mode will remain active until reset");
+    } else {
+      const unsigned long btWaitDeadlineMs = millis() + ((unsigned long)btWaitSeconds * 1000UL);
+      Serial.printf("[BT_BOOT] Listening up to %u seconds for Bluetooth client before entering Full WiFi\n", btWaitSeconds);
+      while (!bluetoothClientConnected() && (long)(millis() - btWaitDeadlineMs) < 0) {
+        // Keep the Bluetooth protocol and mount path alive during the gate.
+        handleBluetoothLX200();
+        serviceMountPolling();
+        delay(20);
+        yield();
+      }
+
+      if (bluetoothClientConnected()) {
+        handleBluetoothLX200();
+        Serial.println("[BT_BOOT] Bluetooth client detected; staying Bluetooth-only until reset");
+      } else {
+        Serial.printf("[BT_BOOT] No Bluetooth client in %u seconds; entering Full WiFi without reboot\n", btWaitSeconds);
+        stopBluetoothService();
+        bridgeMode = BRIDGE_MODE_WIFI_FULL;
+        startupModeSource = "Bluetooth window expired: Full WiFi";
+        startupModePinUsed = -1;
+        wifiRuntimeEnabled = true;
+        staRuntimeDisabled = false;
+        btLiteBootWebEnabled = false;
+        setBluetoothTinyWebRuntimeEnabled(false);
+        setupWiFiFromSavedConfig();
+      }
+    }
+  }
 #endif
 
   allocateNetworkServiceObjects();
 
 #if defined(ESP32)
-  if (ESP32_BOOT_WEB_ONLY || bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
+  if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
     Serial.println("[BT_MIN] UDP/LX200 WiFi/Stellarium listeners skipped; Telnet starts separately in BT");
   } else
 #endif
@@ -4123,6 +4006,7 @@ delay(500);
     server.on("/", HTTP_GET, handleRoot);
     server.on("/http_health", HTTP_GET, handleHttpHealthPage);
     server.on("/status", HTTP_GET, handleStatusPage);
+    server.on("/help", HTTP_GET, handleWebHelpPage);
     server.on("/btstatus", HTTP_GET, handleBtStatusPage);
     server.on("/bsc5_data", HTTP_GET, handleBsc5DataPage);
     server.on("/status_text", HTTP_GET, handleStatusTextPage);
@@ -4195,21 +4079,7 @@ delay(500);
       Serial.println("[BT_MIN] Alpaca HTTP server skipped");
     }
   } else {
-    Serial.println(bridgeMode == BRIDGE_MODE_WIFI_SERVERS ?
-                   "[WIFI_NOWEB] Browser Web UI disabled; protocol servers remain active" :
-                   "[BT_MIN] Full Web UI disabled; BT main/status pages are available");
-  }
-
-  if (bridgeMode == BRIDGE_MODE_WIFI_SERVERS && alpacaServer) {
-    activeServer = alpacaServer;
-    LOG_ALP_I("Registering Alpaca API routes on port %u", ALPACA_PORT);
-    server.on("/management/apiversions", HTTP_GET, handleManagementApiVersions);
-    server.on("/management/v1/description", HTTP_GET, handleManagementDescription);
-    server.on("/management/v1/configureddevices", HTTP_GET, handleConfiguredDevices);
-    server.onNotFound(handleNotFound);
-    Serial.println("[BOOT] alpacaServer.begin");
-    server.begin();
-    Serial.printf("[ALPACA] HTTP server started on port %u\n", ALPACA_PORT);
+    Serial.println("[BT_MIN] Full Web UI disabled; BT main/status pages are available");
   }
 
   activeServer = webServer ? webServer : alpacaServer;
@@ -4250,85 +4120,51 @@ void loop() {
   unsigned long loopStart = millis();
 
   if (bridgeModeHasWifiProtocols()) {
-    CRASHDUMP_SCOPE("lx200 pre-poll");
     diagnosticServiceBegin("lx200-pre");
     handleLX200Server();
     diagnosticServiceEnd();
-    crashdumpMarkService("lx200 pre-poll");
   }
 
   // Highest-priority task: maintain the configured mount poll interval before
   // servicing console, web, protocol, Telnet, or other lower-priority work.
-  { CRASHDUMP_SCOPE("mount poll top"); serviceMountPolling(); crashdumpMarkService("mount poll top"); }
+  serviceMountPolling();
 
 #if defined(ESP32)
   serviceHttpsSetupStop();
 #endif
 
-  { CRASHDUMP_SCOPE("console"); PROFILE_SCOPE(PROFILE_CONSOLE); handleConsole(); crashdumpMarkService("console"); }
-  { CRASHDUMP_SCOPE("mount poll console"); serviceMountPolling(); crashdumpMarkService("mount poll console"); }
-  if (!bridgeModeHasWebUi()) { CRASHDUMP_SCOPE("http no-web"); diagnosticServiceBegin("http-no-web"); serviceHttpServers(); diagnosticServiceEnd(); crashdumpMarkService("http no-web"); }
-  { CRASHDUMP_SCOPE("mount poll http1"); serviceMountPolling(); crashdumpMarkService("mount poll http1"); }
-  { CRASHDUMP_SCOPE("restart"); PROFILE_SCOPE(PROFILE_RESTART); serviceRestart(); crashdumpMarkService("restart"); }
-  { CRASHDUMP_SCOPE("mount poll restart"); serviceMountPolling(); crashdumpMarkService("mount poll restart"); }
+  { PROFILE_SCOPE(PROFILE_CONSOLE); handleConsole(); }
+  if (!bridgeModeHasWebUi()) { diagnosticServiceBegin("http-no-web"); serviceHttpServers(); diagnosticServiceEnd(); }
+  { PROFILE_SCOPE(PROFILE_RESTART); serviceRestart(); }
 
 #if defined(ESP32)
-  if (ESP32_BOOT_WEB_ONLY) {
-    static unsigned long lastWebOnlyBeatMs = 0;
-    if (millis() - lastWebOnlyBeatMs > 5000) {
-      lastWebOnlyBeatMs = millis();
-      Serial.printf("[WEB_ONLY] alive ip=%s stations=%d heap=%u\n",
-                    WiFi.softAPIP().toString().c_str(),
-                    WiFi.softAPgetStationNum(),
-                    ESP.getFreeHeap());
-    }
-    lastLoopTimeMs = millis() - loopStart;
-    if (lastLoopTimeMs > maxLoopTimeMs) maxLoopTimeMs = lastLoopTimeMs;
-    lastLoopLatencyMs = lastLoopTimeMs;
-    if (lastLoopLatencyMs > maxLoopLatencyMs) maxLoopLatencyMs = lastLoopLatencyMs;
-#if defined(ESP32)
-    diagnosticLastLoopMs = millis();
-    diagnosticLoopBeat++;
-#endif
-    serviceFirmwareHeartbeat("web-only");
-    yield();
-    return;
-  }
 #endif
 
   if (bridgeModeHasWifiProtocols()) {
-    { CRASHDUMP_SCOPE("alpaca discovery"); diagnosticServiceBegin("alpaca-discovery"); handleAlpacaDiscovery(); diagnosticServiceEnd(); crashdumpMarkService("alpaca discovery"); }
-    { CRASHDUMP_SCOPE("mount poll alpaca"); serviceMountPolling(); crashdumpMarkService("mount poll alpaca"); }
-    { CRASHDUMP_SCOPE("lx200 server"); diagnosticServiceBegin("lx200"); handleLX200Server(); diagnosticServiceEnd(); crashdumpMarkService("lx200 server"); }
-    { CRASHDUMP_SCOPE("mount poll lx200"); serviceMountPolling(); crashdumpMarkService("mount poll lx200"); }
-    { CRASHDUMP_SCOPE("http servers"); diagnosticServiceBegin("http"); serviceHttpServers(); diagnosticServiceEnd(); crashdumpMarkService("http servers"); }
-    { CRASHDUMP_SCOPE("mount poll http2"); serviceMountPolling(); crashdumpMarkService("mount poll http2"); }
-    { CRASHDUMP_SCOPE("stellarium"); diagnosticServiceBegin("stellarium"); handleStellariumServer(); diagnosticServiceEnd(); crashdumpMarkService("stellarium"); }
-    { CRASHDUMP_SCOPE("mount poll stel"); serviceMountPolling(); crashdumpMarkService("mount poll stel"); }
-    { CRASHDUMP_SCOPE("telnet"); diagnosticServiceBegin("telnet"); serviceTelnetConsole(); diagnosticServiceEnd(); crashdumpMarkService("telnet"); }
-    { CRASHDUMP_SCOPE("mount poll telnet"); serviceMountPolling(); crashdumpMarkService("mount poll telnet"); }
-    { CRASHDUMP_SCOPE("ntp sync"); PROFILE_SCOPE(PROFILE_NTP_SYNC); serviceNtpSync(); crashdumpMarkService("ntp sync"); }
-    { CRASHDUMP_SCOPE("mount poll ntp"); serviceMountPolling(); crashdumpMarkService("mount poll ntp"); }
-    { CRASHDUMP_SCOPE("goto watch"); serviceGotoCompletionWatch(); crashdumpMarkService("goto watch"); }
-    { CRASHDUMP_SCOPE("goto queue"); PROFILE_SCOPE(PROFILE_GOTO_QUEUE); serviceGotoQueue(); crashdumpMarkService("goto queue"); }
-    { CRASHDUMP_SCOPE("async slew"); serviceAsyncSlew(); crashdumpMarkService("async slew"); }
+    { diagnosticServiceBegin("alpaca-discovery"); handleAlpacaDiscovery(); diagnosticServiceEnd(); }
+    { diagnosticServiceBegin("lx200"); handleLX200Server(); diagnosticServiceEnd(); }
+    { diagnosticServiceBegin("http"); serviceHttpServers(); diagnosticServiceEnd(); }
+    { diagnosticServiceBegin("stellarium"); handleStellariumServer(); diagnosticServiceEnd(); }
+    { diagnosticServiceBegin("telnet"); serviceTelnetConsole(); diagnosticServiceEnd(); }
+    { PROFILE_SCOPE(PROFILE_NTP_SYNC); serviceNtpSync(); }
+    serviceExplicitApproxLocation();
+    serviceAutomaticApproxLocation();
+    serviceGotoCompletionWatch();
+    { PROFILE_SCOPE(PROFILE_GOTO_QUEUE); serviceGotoQueue(); }
+    serviceAsyncSlew();
   } else {
-    if (bridgeModeHasWebUi()) { CRASHDUMP_SCOPE("http web-only"); diagnosticServiceBegin("http-web-only"); serviceHttpServers(); diagnosticServiceEnd(); crashdumpMarkService("http web-only"); }
-    else { CRASHDUMP_SCOPE("tiny setup"); serviceTinySetupServer(); crashdumpMarkService("tiny setup"); }
-    { CRASHDUMP_SCOPE("mount poll webonly"); serviceMountPolling(); crashdumpMarkService("mount poll webonly"); }
-    { CRASHDUMP_SCOPE("telnet"); serviceTelnetConsole(); crashdumpMarkService("telnet"); }
-    { CRASHDUMP_SCOPE("mount poll telnet"); serviceMountPolling(); crashdumpMarkService("mount poll telnet"); }
+    if (bridgeModeHasWebUi()) { diagnosticServiceBegin("http-web-only"); serviceHttpServers(); diagnosticServiceEnd(); }
+    else { serviceTinySetupServer(); }
+    serviceTelnetConsole();
     if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
-      { CRASHDUMP_SCOPE("bt lx200"); handleBluetoothLX200(); crashdumpMarkService("bt lx200"); }
-      { CRASHDUMP_SCOPE("bt wifi coexist"); serviceBluetoothClientWifiCoexistence(); crashdumpMarkService("bt wifi coexist"); }
+      handleBluetoothLX200();
+      serviceBluetoothClientWifiCoexistence();
     }
-    { CRASHDUMP_SCOPE("mount poll bt"); serviceMountPolling(); crashdumpMarkService("mount poll bt"); }
-    { CRASHDUMP_SCOPE("goto watch"); serviceGotoCompletionWatch(); crashdumpMarkService("goto watch"); }
-    { CRASHDUMP_SCOPE("goto queue"); PROFILE_SCOPE(PROFILE_GOTO_QUEUE); serviceGotoQueue(); crashdumpMarkService("goto queue"); }
-    { CRASHDUMP_SCOPE("async slew"); serviceAsyncSlew(); crashdumpMarkService("async slew"); }
+    serviceGotoCompletionWatch();
+    { PROFILE_SCOPE(PROFILE_GOTO_QUEUE); serviceGotoQueue(); }
+    serviceAsyncSlew();
   }
-  { CRASHDUMP_SCOPE("site time apply"); applyPendingSiteTimeUpdate(); crashdumpMarkService("site time apply"); }
-  { CRASHDUMP_SCOPE("mount poll final"); serviceMountPolling(); crashdumpMarkService("mount poll final"); }
+  applyPendingSiteTimeUpdate();
 
   lastLoopTimeMs = millis() - loopStart;
   if (lastLoopTimeMs > maxLoopTimeMs) maxLoopTimeMs = lastLoopTimeMs;
@@ -4338,7 +4174,7 @@ void loop() {
   diagnosticLastLoopMs = millis();
   diagnosticLoopBeat++;
 #endif
-  serviceFirmwareHeartbeat(bridgeModeName());
+  statusLedService();
 
   yield();
 }
