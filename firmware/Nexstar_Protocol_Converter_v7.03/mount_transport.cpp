@@ -513,12 +513,11 @@ void runRawMountDiagnostic(Print &out, uint16_t cycles, bool includeAltAz, unsig
   if (cycles > 200) cycles = 200;
   if (intervalMs > 10000) intervalMs = 10000;
 
-  if (mountBusy) {
+  const char* commandName = "rawmount diagnostic";
+  if (!beginMountCommand(commandName)) {
     out.println("rawmount refused: mountBusy=true");
     return;
   }
-
-  mountBusy = true;
   uint16_t handshakeOk = 0;
   uint16_t handshakeFail = 0;
   uint16_t eOk = 0;
@@ -575,7 +574,7 @@ void runRawMountDiagnostic(Print &out, uint16_t cycles, bool includeAltAz, unsig
     }
   }
 
-  mountBusy = false;
+  endMountCommand(commandName);
   out.printf("rawmount summary cycles=%u handshakeOK=%u handshakeFail=%u ignoredHandshakeBytes=%lu E_OK=%u E_FAIL=%u Z_OK=%u Z_FAIL=%u\n",
              (unsigned)cycles,
              (unsigned)handshakeOk,
@@ -592,12 +591,11 @@ void runRawGotoSelfDiagnostic(Print &out, uint16_t cycles, bool waitForCompletio
   if (cycles > 50) cycles = 50;
   if (intervalMs > 10000) intervalMs = 10000;
 
-  if (mountBusy) {
+  const char* commandName = "rawgoto diagnostic";
+  if (!beginMountCommand(commandName)) {
     out.println("rawgoto refused: mountBusy=true");
     return;
   }
-
-  mountBusy = true;
   uint16_t readOk = 0;
   uint16_t readFail = 0;
   uint16_t gotoHandshakeOk = 0;
@@ -682,7 +680,7 @@ void runRawGotoSelfDiagnostic(Print &out, uint16_t cycles, bool waitForCompletio
     }
   }
 
-  mountBusy = false;
+  endMountCommand(commandName);
   out.printf("rawgoto summary cycles=%u readOK=%u readFail=%u gotoHandshakeOK=%u gotoHandshakeFail=%u gotoSent=%u completionOK=%u completionFail=%u ignoredHandshakeBytes=%lu\n",
              (unsigned)cycles,
              (unsigned)readOk,

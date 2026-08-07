@@ -19,7 +19,10 @@ def decode_cpp_string(raw: str) -> str:
 def extract_page() -> bytes:
     source = SOURCE.read_text(encoding="utf-8")
     start = source.index("void sendWebPage()")
-    end = source.index("void handleLogsPage()", start)
+    # The offline help route follows the main page in the sketch. Stop before
+    # it so the help guide is not accidentally embedded at the bottom of the
+    # primary Web UI asset.
+    end = source.index("void handleWebHelpPage()", start)
     block = source[start:end]
     chunks = []
     for line in block.splitlines():
@@ -29,7 +32,7 @@ def extract_page() -> bytes:
                 raise RuntimeError(f"Unable to parse UI chunk: {line[:100]}")
             chunks.append(decode_cpp_string(match.group(1)))
         elif "server.sendContent(FW_NAME);" in line:
-            chunks.append("NexStar Protocol Converter")
+            chunks.append(re.search(r'FW_NAME\s*=\s*"([^"]+)"', source).group(1))
         elif "server.sendContent(FW_VERSION);" in line:
             chunks.append(re.search(r'FW_VERSION\s*=\s*"([^"]+)"', source).group(1))
         elif "server.sendContent(htmlEscape(staPass));" in line:
@@ -42,6 +45,11 @@ def extract_page() -> bytes:
     page = page.replace("setInterval(refreshProtocolDash,8000);", "")
     page = page.replace("setInterval(updateNow,8000+refreshJitter)", "setInterval(updateNow,12000+refreshJitter)")
     page = page.replace("setInterval(refreshLogs,5000+refreshJitter)", "setInterval(refreshLogs,10000+refreshJitter)")
+    page = page.replace(
+        "Reboot</button><button onclick='scaleUi",
+        "Reboot</button><button title='Offline help' onclick=\"window.open('/help','_blank')\">?</button><button onclick='scaleUi",
+        1
+    )
     page = page.replace(
         "</select></div><div class='formrow'><label>Sort</label>",
         "</select><button id='catLoadBtn' style='display:none' onclick='loadBSC5FromButton()'>Load Catalog</button></div><div class='formrow'><label>Sort</label>",
@@ -70,6 +78,18 @@ def extract_page() -> bytes:
         "if(typeof catPopulate==='function')catPopulate();},250);",
         "if(typeof updateCatLoadButton==='function')updateCatLoadButton();if(typeof catPopulate==='function')catPopulate();},250);"
     )
+    # Load BSC5 automatically, but only after the UI has been visible and the
+    # normal status/setup work has settled.  The raw catalog is cached in the
+    # browser, so this is a one-time network transfer per firmware version and
+    # never consumes ESP32 RAM beyond the streamed response.
+    page = page.replace(
+        "function initialPageLoad(){",
+        "function scheduleBSC5Load(){setTimeout(()=>{if(document.visibilityState==='visible'&&!catBSCLoaded&&!catBSCLoading){loadBSC5().then(()=>{catPopulate();identifyPointingNow()})}},6000)}function initialPageLoad(){"
+    )
+    page = page.replace(
+        "if(typeof catUpdate==='function')catUpdate()},4500)}",
+        "if(typeof catUpdate==='function')catUpdate()},4500);scheduleBSC5Load()}"
+    )
     return page.encode("utf-8")
 
 
@@ -82,7 +102,7 @@ def emit_header(data: bytes) -> None:
 
 #include <Arduino.h>
 
-// Generated from Nexstar_Protocol_Converter_v7.03.ino.
+// Generated from the canonical Nexstar5/8-Bridge firmware source.
 // Do not edit manually; rerun tools_generate_web_asset.py.
 static const uint8_t WEB_UI_GZIP[] PROGMEM = {{
 {bytes}

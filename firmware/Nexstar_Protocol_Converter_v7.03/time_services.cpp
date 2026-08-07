@@ -20,6 +20,10 @@ String approxIpLocationText = "";
 String approxIpLocationStatus = "Not fetched";
 bool approxIpLocationValid = false;
 
+static bool automaticApproxLocationPending = false;
+static unsigned long automaticApproxLocationDueMs = 0;
+static bool explicitApproxLocationPending = false;
+
 extern String urlDecodeSimple(String s);
 
 String currentUtcIsoString() {
@@ -197,6 +201,64 @@ void serviceNtpSync() {
     lastAttemptMs = now;
     syncTimeFromNTP(false);
   }
+}
+
+void requestAutomaticApproxLocation() {
+  // Defer the HTTP request until the STA connection has settled.  This keeps
+  // it out of the WiFi connection callback and avoids competing with the
+  // first listener re-arm and NTP attempt.
+  automaticApproxLocationPending = true;
+  automaticApproxLocationDueMs = millis() + 2000UL;
+  approxIpLocationStatus = "Waiting for automatic STA location lookup";
+}
+
+void requestExplicitApproxLocation() {
+  // The Setup action must only queue work.  In particular, do not run the
+  // blocking HTTPClient transaction from an async web-server callback.
+  automaticApproxLocationPending = false;
+  explicitApproxLocationPending = true;
+  approxIpLocationStatus = "Approx IP location lookup queued";
+  LOG_TIME_I("Explicit IP geolocation queued for main-loop service");
+}
+
+void serviceExplicitApproxLocation() {
+  if (!explicitApproxLocationPending) return;
+  if (!staConnected || WiFi.status() != WL_CONNECTED) {
+    explicitApproxLocationPending = false;
+    approxIpLocationStatus = "STA WiFi is not connected";
+    return;
+  }
+
+  explicitApproxLocationPending = false;
+  approxIpLocationStatus = "Approx IP location lookup in progress";
+  LOG_TIME_I("Explicit IP geolocation starting from main-loop service");
+  fetchApproxLocationFromInternet();
+}
+
+void serviceAutomaticApproxLocation() {
+  if (!automaticApproxLocationPending) return;
+  if (!staConnected || WiFi.status() != WL_CONNECTED) return;
+  if ((long)(millis() - automaticApproxLocationDueMs) < 0) return;
+
+  automaticApproxLocationPending = false;
+  if (siteValid) {
+    approxIpLocationStatus = "Saved site location retained";
+    LOG_TIME_I("Automatic IP geolocation skipped: saved site location is valid");
+    return;
+  }
+
+  LOG_TIME_I("Automatic IP geolocation starting after STA connection");
+  if (!fetchApproxLocationFromInternet()) return;
+
+  // Use the approximate result only when no valid observer site was already
+  // available.  The user can still explicitly fetch/use it from Setup.
+  siteLatitudeDeg = approxIpLatitudeDeg;
+  siteLongitudeDeg = approxIpLongitudeDeg;
+  siteValid = true;
+  currentLocationSource = "Approx IP geolocation";
+  savePersistentSettings();
+  LOG_TIME_I("Automatic IP geolocation applied: lat=%.6f lon=%.6f",
+             siteLatitudeDeg, siteLongitudeDeg);
 }
 
 bool extractJsonNumber(const String &body, const String &key, double &out) {

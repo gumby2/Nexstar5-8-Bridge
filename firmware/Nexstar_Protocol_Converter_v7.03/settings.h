@@ -16,16 +16,9 @@ extern const char* AP_SSID;
 extern const char* AP_PASS;
 extern const char* WIFI_FILE;
 
-extern const bool ESP32_FORCE_AP_DEFAULTS;
-extern const bool ESP32_DISABLE_LITTLEFS_SETTINGS;
-extern const bool ESP32_BOOT_AP_ONLY;
-extern const bool ESP32_BOOT_DISABLE_BACKGROUND_POLLING;
-extern const bool ESP32_BOOT_WEB_ONLY;
 
 extern const uint8_t BRIDGE_MODE_WIFI_FULL;
 extern const uint8_t BRIDGE_MODE_BT_MIN_WEB;
-extern const uint8_t BRIDGE_MODE_WIFI_SERVERS;
-extern const uint8_t BRIDGE_MODE_WEB_ONLY;
 extern uint8_t bridgeMode;
 
 extern uint16_t ALPACA_PORT;
@@ -65,6 +58,7 @@ extern unsigned long idlePollIntervalMs;
 extern unsigned long mountHandshakeTimeoutMs;
 extern unsigned long minClientPollIntervalMs;
 extern unsigned long gotoQueueTimeoutMs;
+extern uint16_t btWaitSeconds;
 extern unsigned long lastPersistentSaveMs;
 extern uint32_t persistentSaveCount;
 
@@ -85,6 +79,7 @@ struct PersistentSettings {
   unsigned long idlePollIntervalMs;
   unsigned long mountHandshakeTimeoutMs;
   unsigned long minClientPollIntervalMs;
+  uint16_t btWaitSeconds;
   bool siteValid;
 
   double nudgeRateDeg[4];
@@ -129,11 +124,6 @@ void clearWiFiConfig();
 bool saveBluetoothLiteStaModeFlag(bool disableSta);
 bool saveBluetoothLiteApOnlySettings();
 
-bool loadBridgeMode();
-bool saveBridgeMode(uint8_t mode);
 bool loadFirmwareLoggingEnabled();
 bool saveFirmwareLoggingEnabled(bool enabled);
-bool saveBluetoothLiteWebBootEnabled(bool enabled);
-bool saveBluetoothLitePollInterval(unsigned long ms);
-bool loadBluetoothLitePollInterval();
 bool saveGotoQueueTimeoutMs(unsigned long v);

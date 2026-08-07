@@ -1,4 +1,3 @@
-#include "crashdump.h"
 #include "console_commands.h"
 
 #include "bluetooth_services.h"
@@ -93,6 +92,7 @@ static void consoleQueueGotoAltAz(const String &args) {
 
 extern uint16_t logCategoryBitFromName(const String &name);
 extern String currentStateText();
+extern void printBasicStatusText(Print &out);
 extern String formatUptime();
 extern String resetReasonText();
 extern String runtimeApSsid();
@@ -203,17 +203,9 @@ void printHelpMode() {
   Serial.println();
   Serial.println("=== Mode and Runtime Commands ===");
   Serial.println("  mode");
-  Serial.println("      Show current mode and active services.");
-  Serial.println("  mode bt");
-  Serial.println("      Save Bluetooth + WiFi Telnet mode, then reboot.");
-  Serial.println("  mode wifi");
-  Serial.println("      Save Full WiFi web/protocol mode, then reboot.");
-  Serial.println("  mode wifi noweb");
-  Serial.println("      Save WiFi protocol servers with browser Web UI disabled, then reboot.");
-  Serial.println("  mode web");
-  Serial.println("      Save Web UI + Telnet only mode, then reboot.");
+  Serial.println("      Show current services and the fixed startup policy; startup mode is not saved or selectable.");
   Serial.println("  web | web status | webserver | webserver status");
-  Serial.println("      Show Web UI state. Use mode commands to change saved Web UI behavior.");
+  Serial.println("      Show Web UI state. Full WiFi is the normal post-startup service mode.");
   Serial.println("  wifi | wifi status");
   Serial.println("      Show WiFi runtime, AP/STA connection, and IP information.");
   Serial.println("  wifi on | wifi off");
@@ -277,18 +269,18 @@ void printHelpStatus() {
   Serial.println("      Show system-health counters, loop and poll latency, memory, uptime, and errors.");
   Serial.println("  profile | profile 0 | profile 1 | profile clear");
   Serial.println("      Show, disable/enable, or clear low-overhead service timing counters.");
-  Serial.println("  crashdump");
-  Serial.println("      Show the last firmware activities preserved across reset when possible.");
   Serial.println("  tasks");
   Serial.println("      Show FreeRTOS runtime task stats if enabled in the build.");
   Serial.println("  gpio_startup");
-  Serial.println("      Show startup GPIO override state, selected pin, priority, and forced modes.");
+  Serial.println("      Show startup GPIO override state and whether GPIO27 forces Bluetooth-only startup.");
   Serial.println("  telnet");
   Serial.println("      Show Telnet runtime status and counters.");
   Serial.println("  telnet down | telnet 0");
   Serial.println("      Stop/unload only the Telnet server; WiFi stays on.");
   Serial.println("  telnet on | telnet 1");
   Serial.println("      Start only the Telnet server; WiFi is unchanged.");
+  Serial.println("  catalog | bsc5 | stars");
+  Serial.println("      The Web UI automatically loads and browser-caches the 9,096-entry BSC5 catalog.");
 }
 
 void printHelpTopic(const String &topicRaw) {
@@ -308,7 +300,13 @@ void printHelpTopic(const String &topicRaw) {
     Serial.println();
     Serial.println("=== Web Server Command ===");
     Serial.println("  web | web status | webserver | webserver status");
-    Serial.println("      Show Web UI state. Use mode commands to change saved Web UI behavior.");
+    Serial.println("      Show Web UI state and the active startup policy.");
+  } else if (topic == "catalog" || topic == "bsc5" || topic == "stars") {
+    Serial.println();
+    Serial.println("=== Catalog ===");
+    Serial.println("  The Web UI loads the 9,096-entry BSC5 Bright Star Catalog");
+    Serial.println("  about six seconds after the page becomes visible, then caches it by firmware version.");
+    Serial.println("  Catalog search, nearby-object selection, and catalog GOTO remain Web UI actions.");
   } else if (topic == "reboot" || topic == "restart") {
     Serial.println();
     Serial.println("=== Reboot Command ===");
@@ -367,24 +365,6 @@ void printHelpTopic(const String &topicRaw) {
     Serial.println("      Disable or enable profiling.");
     Serial.println("  profile clear");
     Serial.println("      Reset profile counters.");
-  } else if (topic == "crashdump") {
-    Serial.println();
-    Serial.println("=== crashdump ===");
-    Serial.println("  crashdump");
-    Serial.println("      Show the last recorded firmware activities.");
-    Serial.println("      Automatically printed at boot when previous entries survived reset.");
-    Serial.println("      Useful after watchdog/crash resets to see what began or completed last.");
-    Serial.println("  crashdump live");
-    Serial.println("      Show current heartbeat and service liveness ages.");
-    Serial.println("      Columns:");
-    Serial.println("        ms      milliseconds since that boot");
-    Serial.println("        core    CPU core that wrote the entry");
-    Serial.println("        heap    free heap at the entry");
-    Serial.println("        largest largest free heap block at the entry");
-    Serial.println("        event   begin, end, or boot");
-    Serial.println("        detail  firmware section name");
-    Serial.println("      If the newest previous entry is 'begin <section>' with no matching end,");
-    Serial.println("      the reset/freeze probably happened inside that section.");
   } else if (topic == "tasks") {
     Serial.println();
     Serial.println("=== tasks ===");
@@ -402,7 +382,7 @@ void printHelpTopic(const String &topicRaw) {
     Serial.println();
     Serial.println("=== Startup GPIO Command ===");
     Serial.println("  gpio_startup");
-    Serial.println("      Show startup GPIO override state, selected pin, pin priority, and the mode each pin forces.");
+    Serial.println("      Show startup GPIO override state and whether GPIO27 forces Bluetooth-only startup.");
   } else if (topic == "telnet") {
     Serial.println();
     Serial.println("=== Telnet Status Command ===");
@@ -440,7 +420,7 @@ void printHelpTopic(const String &topicRaw) {
     Serial.println(topicRaw);
     Serial.println("Grouped topics: mount, mode, wifi");
     Serial.println("Specific topics: log, web, reboot, testinit, get, getaltaz, rates, mountpoll,");
-    Serial.println("                 handshake, profile, crashdump, nudge, idlepoll, drain, pos, health, tasks, gpio_startup, telnet,");
+    Serial.println("                 handshake, profile, nudge, idlepoll, drain, pos, health, tasks, gpio_startup, telnet,");
     Serial.println("                 telnetlog, setsta, apdefault");
   }
 }
@@ -455,7 +435,6 @@ void printHelp() {
   Serial.println("  current_state | currentstate | state | pos");
   Serial.println("  system_health | systemhealth | health");
   Serial.println("  profile | profile 0 | profile 1 | profile clear");
-  Serial.println("  crashdump");
   Serial.println("  tasks");
   Serial.println("  gpio_startup");
   Serial.println("  telnet");
@@ -470,7 +449,6 @@ void printHelp() {
   Serial.println("  nudge az+ | nudge az- | nudge alt+ | nudge alt-");
   Serial.println("Mode:");
   Serial.println("  mode");
-  Serial.println("  mode bt | mode wifi | mode wifi noweb | mode web");
   Serial.println("  web | web status");
   Serial.println("  wifi | wifi status | wifi on | wifi off");
   Serial.println("  reboot | restart");
@@ -583,10 +561,6 @@ bool commandRequiresDisconnectConfirm(const String &cmd, bool telnetSession, Str
     description = "This command will turn WiFi off and may disconnect clients.";
     return true;
   }
-  if (cmd == "mode bt" || cmd == "mode wifi" || cmd == "mode wifi noweb" || cmd == "mode web") {
-    description = "This command will save boot mode and reboot the controller.";
-    return true;
-  }
   if (cmd == "apdefault") {
     description = "This command will restart the AP/radio path and may disconnect clients.";
     return true;
@@ -635,9 +609,7 @@ String formatAgeSeconds(unsigned long timestampMs) {
 void printConsoleHealth(Print &out) {
   out.println("=== System Health ===");
   out.println("POLL SCHEDULER");
-  out.printf("Mount poll interval: %lu ms%s\n", pollIntervalMs, pollIntervalMs == 0 ? " (off)" : "");
-  out.printf("Idle poll interval: %lu ms%s\n", idlePollIntervalMs, idlePollIntervalMs == 0 ? " (off)" : "");
-  out.printf("Handshake timeout: %lu ms\n", mountHandshakeTimeoutMs);
+  out.printf("Effective poll interval: %lu ms\n", effectiveMountPollIntervalMs());
   out.printf("Poll latency current/max: %lu/%lu ms\n",
              lastPollSchedulerLatencyMs,
              maxPollSchedulerLatencyMs);
@@ -645,7 +617,6 @@ void printConsoleHealth(Print &out) {
   out.printf("Poll failures: %lu auto-disabled=%s\n",
              backgroundPollFailCount,
              backgroundPollingAutoDisabled ? "yes" : "no");
-  out.printf("Mount uptime: %s h:mm\n", formatMountUptime().c_str());
   out.println();
   out.println("LOOP");
   out.printf("Loop latency current/max: %lu/%lu ms\n", lastLoopLatencyMs, maxLoopLatencyMs);
@@ -734,14 +705,6 @@ void handleConsole() {
     profilerPrint(Serial);
   }
 
-  else if (cmd == "crashdump live") {
-    crashdumpPrintLive(Serial);
-  }
-
-  else if (cmd == "crashdump") {
-    crashdumpPrint(Serial);
-  }
-
   else if (cmd == "profile clear" || cmd == "profiler clear") {
     profilerReset();
     Serial.println("Profiler counters cleared.");
@@ -771,7 +734,7 @@ void handleConsole() {
 
   else if (cmd == "web" || cmd == "web status" || cmd == "webserver" || cmd == "webserver status") {
     Serial.printf("Web UI: %s\n", bridgeModeHasWebUi() ? "listening" : "disabled");
-    Serial.println("Use mode wifi, mode wifi noweb, mode web, or mode bt to change saved Web UI behavior.");
+    Serial.println("Startup mode is fixed: reset opens the Bluetooth window, then enters Full WiFi unless Bluetooth connects or GPIO27 is grounded.");
   }
 
   else if (cmd == "wifi" || cmd == "wifi status") {
@@ -822,29 +785,8 @@ void handleConsole() {
     printConsoleModeStatus(Serial);
   }
 
-  else if (cmd == "mode bt") {
-    saveBluetoothLiteWebBootEnabled(false);
-    saveBridgeMode(BRIDGE_MODE_BT_MIN_WEB);
-    scheduleRestart("serial mode bt");
-    Serial.println("Saved BT + WiFi Telnet mode; restarting. Web UI and WiFi protocol servers will not start.");
-  }
-
-  else if (cmd == "mode wifi") {
-    saveBridgeMode(BRIDGE_MODE_WIFI_FULL);
-    scheduleRestart("serial mode wifi");
-    Serial.println("Saved full WiFi web mode; restarting...");
-  }
-
-  else if (cmd == "mode wifi noweb") {
-    saveBridgeMode(BRIDGE_MODE_WIFI_SERVERS);
-    scheduleRestart("serial mode wifi noweb");
-    Serial.println("Saved WiFi protocol-server mode with browser Web UI disabled; restarting...");
-  }
-
-  else if (cmd == "mode web") {
-    saveBridgeMode(BRIDGE_MODE_WEB_ONLY);
-    scheduleRestart("serial mode web");
-    Serial.println("Saved Web UI only mode; SkySafari, Alpaca, and Stellarium will be disabled.");
+  else if (cmd == "mode bt" || cmd == "mode wifi" || cmd == "mode wifi noweb" || cmd == "mode web") {
+    Serial.println("Startup mode selection was removed. Reset starts the 60-second Bluetooth window; GPIO27 grounded forces Bluetooth-only.");
   }
 
   else if (cmd == "apdefault") {

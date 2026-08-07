@@ -2,7 +2,11 @@
 
 #include <string.h>
 
+#if defined(DISABLE_OPTIONAL_INSTRUMENTATION)
+bool profilerEnabled = false;
+#else
 bool profilerEnabled = true;
+#endif
 
 static ProfileStats profileStats[PROFILE_COUNT];
 

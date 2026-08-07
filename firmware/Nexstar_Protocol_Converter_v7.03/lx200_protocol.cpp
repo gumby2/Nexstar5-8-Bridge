@@ -324,7 +324,12 @@ bool processLX200Stream(Stream &io, uint8_t source) {
 
   // This is the single shared LX200-to-mount command core.
   // WiFi and Bluetooth differ only at the transport read/write layer.
+  uint32_t txRepliesBefore = source == LX_SRC_BT ? lx200BtTxReplies : 0;
   handleLX200Command(cmd, source);
+  if (source == LX_SRC_BT && lx200BtTxReplies == txRepliesBefore) {
+    lx200BtNoReplyCommands++;
+    lx200BtLastNoReplyCommand = cmd;
+  }
   return true;
 }
 
@@ -343,6 +348,7 @@ void handleLX200Command(const String &rawCmd, uint8_t source) {
   if (source == LX_SRC_BT) {
     lx200BtLastCommand = cmd;
     lx200BtLastCommandHandledMs = millis();
+    bluetoothRecordLX200Rx(cmd);
   }
 
   if ((uint8_t)cmd[0] == 0x06) {

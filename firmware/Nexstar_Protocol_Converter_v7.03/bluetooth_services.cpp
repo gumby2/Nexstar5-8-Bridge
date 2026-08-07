@@ -31,18 +31,117 @@ unsigned long lx200BtLastTxMs = 0;
 uint32_t lx200BtRxCommands = 0;
 uint32_t lx200BtTxReplies = 0;
 uint32_t lx200BtUnhandledCommands = 0;
+uint32_t lx200BtNoReplyCommands = 0;
 String lx200BtLastCommand = "";
 String lx200BtLastReply = "";
 String lx200BtLastUnhandled = "";
+String lx200BtLastNoReplyCommand = "";
 uint32_t lx200BtGotoStageCommands = 0;
 uint32_t lx200BtPollOnlyHintCount = 0;
 unsigned long lx200BtLastCommandHandledMs = 0;
+
+int btSppLastCloseStatus = -1;
+uint32_t btSppLastCloseHandle = 0;
+uint32_t btSppLastClosePortStatus = 0;
+bool btSppLastCloseAsync = false;
+unsigned long btSppLastCloseMs = 0;
+uint32_t btSppCongestionEvents = 0;
+bool btSppLastCongested = false;
+char btTraceLastRx[96] = "";
+char btTraceLastTx[96] = "";
+
+// Short, fixed-size event history for post-disconnect diagnosis.  This is
+// deliberately separate from normal logging: it uses no heap allocation while
+// recording and is only formatted when the diagnostic endpoint is requested.
+static const uint8_t BT_TRACE_HISTORY_DEPTH = 12;
+static const uint8_t BT_TRACE_TEXT_SIZE = 64;
+struct BtTraceEvent {
+  char direction;
+  unsigned long atMs;
+  unsigned long responseMs;
+  char text[BT_TRACE_TEXT_SIZE];
+};
+static BtTraceEvent btTraceHistory[BT_TRACE_HISTORY_DEPTH];
+static uint8_t btTraceHistoryNext = 0;
+static uint8_t btTraceHistoryCount = 0;
+static unsigned long btTracePendingRxMs = 0;
+static bool btTraceResponsePending = false;
 
 static const char* BT_NAME = "NexStar_Bridge";
 
 #if HAS_CLASSIC_BT
 static BluetoothSerial SerialBT;
+
+static void bluetoothSppDiagnosticCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
+  if (!param) return;
+  if (event == ESP_SPP_CLOSE_EVT) {
+    btSppLastCloseStatus = param->close.status;
+    btSppLastCloseHandle = param->close.handle;
+    btSppLastClosePortStatus = param->close.port_status;
+    btSppLastCloseAsync = param->close.async;
+    btSppLastCloseMs = millis();
+  } else if (event == ESP_SPP_CONG_EVT) {
+    btSppLastCongested = param->cong.cong;
+    btSppCongestionEvents++;
+  }
+}
 #endif
+
+static void copyBluetoothTrace(char *dest, size_t destSize, const String &value) {
+  if (destSize == 0) return;
+  size_t length = value.length();
+  if (length >= destSize) length = destSize - 1;
+  memcpy(dest, value.c_str(), length);
+  dest[length] = '\0';
+}
+
+static void recordBluetoothTraceEvent(char direction, const String &s, unsigned long responseMs) {
+  BtTraceEvent &event = btTraceHistory[btTraceHistoryNext];
+  event.direction = direction;
+  event.atMs = millis();
+  event.responseMs = responseMs;
+  copyBluetoothTrace(event.text, sizeof(event.text), s);
+  btTraceHistoryNext = (btTraceHistoryNext + 1) % BT_TRACE_HISTORY_DEPTH;
+  if (btTraceHistoryCount < BT_TRACE_HISTORY_DEPTH) btTraceHistoryCount++;
+}
+
+void bluetoothRecordLX200Rx(const String &s) {
+  copyBluetoothTrace(btTraceLastRx, sizeof(btTraceLastRx), s);
+  btTracePendingRxMs = millis();
+  btTraceResponsePending = true;
+  recordBluetoothTraceEvent('R', s, 0);
+}
+
+void bluetoothRecordLX200Tx(const String &s) {
+  copyBluetoothTrace(btTraceLastTx, sizeof(btTraceLastTx), s);
+  unsigned long responseMs = btTraceResponsePending ? millis() - btTracePendingRxMs : 0;
+  btTraceResponsePending = false;
+  recordBluetoothTraceEvent('T', s, responseMs);
+}
+
+String bluetoothTraceHistoryText() {
+  String text;
+  text.reserve(1100);
+  text += "direction\tms\tresponse_ms\tdata\n";
+  uint8_t first = (btTraceHistoryCount == BT_TRACE_HISTORY_DEPTH)
+                    ? btTraceHistoryNext
+                    : 0;
+  for (uint8_t i = 0; i < btTraceHistoryCount; i++) {
+    const BtTraceEvent &event = btTraceHistory[(first + i) % BT_TRACE_HISTORY_DEPTH];
+    text += event.direction;
+    text += '\t';
+    text += String(event.atMs);
+    text += '\t';
+    if (event.direction == 'T') {
+      text += String(event.responseMs);
+      if (event.responseMs > 500) text += " TIMEOUT_RISK";
+    }
+    text += '\t';
+    text += event.text;
+    text += '\n';
+  }
+  return text;
+}
 
 extern String appendMacSuffixToName(const String &base);
 extern void resetMountPollFailures();
@@ -96,10 +195,6 @@ void setBluetoothTinyWebRuntimeEnabled(bool enabled) {
   tinyWebServerRuntimeEnabled = enabled;
 }
 
-void toggleBluetoothTinyWebRuntimeEnabled() {
-  tinyWebServerRuntimeEnabled = !tinyWebServerRuntimeEnabled;
-}
-
 void setupBluetoothService(bool skipStartup) {
   if (skipStartup) {
     Serial.println("[WEB_ONLY] Bluetooth init skipped");
@@ -117,6 +212,7 @@ void setupBluetoothService(bool skipStartup) {
   if (btOk) {
     bluetoothRuntimeEnabled = true;
     Serial.printf("Bluetooth SPP name: %s\n", runtimeBtName().c_str());
+    SerialBT.register_callback(bluetoothSppDiagnosticCallback);
 #if defined(ESP32)
     coexPreferenceResult = (int)esp_coex_preference_set(ESP_COEX_PREFER_BT);
     coexPreferenceText = "prefer_bt";
@@ -160,6 +256,14 @@ void handleBluetoothLX200() {
     lx200BtLastCommand = "";
     lx200BtLastReply = "";
     lx200BtLastUnhandled = "";
+    btTraceLastRx[0] = '\0';
+    btTraceLastTx[0] = '\0';
+    btTraceHistoryNext = 0;
+    btTraceHistoryCount = 0;
+    btTracePendingRxMs = 0;
+    btTraceResponsePending = false;
+    lx200BtNoReplyCommands = 0;
+    lx200BtLastNoReplyCommand = "";
     lx200BtGotoStageCommands = 0;
     lx200BtPollOnlyHintCount = 0;
     resetMountPollFailures();
@@ -203,6 +307,7 @@ void bluetoothSendLX200Response(const String &s) {
     lx200BtLastTxMs = millis();
     lx200BtTxReplies++;
     lx200BtLastReply = s;
+    bluetoothRecordLX200Tx(s);
     if (!lx200SuppressNextReplyLog) {
       LOG_SKY_D("LX200 BT TX reply #%lu: %s", (unsigned long)lx200BtTxReplies, s.c_str());
     }

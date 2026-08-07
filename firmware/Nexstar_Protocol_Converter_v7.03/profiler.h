@@ -3,6 +3,13 @@
 #include <Arduino.h>
 #include <stdint.h>
 
+// Production firmware keeps explicit diagnostic commands available, but does
+// not collect profiler timings or service-duration instrumentation on every
+// loop.  This avoids continuous micros() calls and counter updates.
+#ifndef DISABLE_OPTIONAL_INSTRUMENTATION
+  #define DISABLE_OPTIONAL_INSTRUMENTATION 1
+#endif
+
 enum ProfileSection : uint8_t {
   PROFILE_LOOP = 0,
   PROFILE_MOUNT_POLL,
@@ -51,6 +58,10 @@ private:
   uint32_t startUs_;
 };
 
-#define PROFILE_SCOPE_CONCAT_INNER(a, b) a##b
-#define PROFILE_SCOPE_CONCAT(a, b) PROFILE_SCOPE_CONCAT_INNER(a, b)
-#define PROFILE_SCOPE(section) ProfileScope PROFILE_SCOPE_CONCAT(profileScopeInstance_, __LINE__)(section)
+#if defined(DISABLE_OPTIONAL_INSTRUMENTATION)
+  #define PROFILE_SCOPE(section) do { (void)sizeof(section); } while (0)
+#else
+  #define PROFILE_SCOPE_CONCAT_INNER(a, b) a##b
+  #define PROFILE_SCOPE_CONCAT(a, b) PROFILE_SCOPE_CONCAT_INNER(a, b)
+  #define PROFILE_SCOPE(section) ProfileScope PROFILE_SCOPE_CONCAT(profileScopeInstance_, __LINE__)(section)
+#endif

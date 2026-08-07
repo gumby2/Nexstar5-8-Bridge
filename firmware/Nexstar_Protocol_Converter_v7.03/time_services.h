@@ -19,6 +19,10 @@ String observerTimeText();
 
 bool syncTimeFromNTP(bool forceLog = true);
 void serviceNtpSync();
+void requestAutomaticApproxLocation();
+void serviceAutomaticApproxLocation();
+void requestExplicitApproxLocation();
+void serviceExplicitApproxLocation();
 
 bool extractJsonNumber(const String &body, const String &key, double &out);
 String extractJsonString(const String &body, const String &key);

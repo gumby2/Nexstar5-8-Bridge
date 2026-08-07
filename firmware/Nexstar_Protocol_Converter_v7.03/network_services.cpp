@@ -22,6 +22,11 @@
 
 #include <string.h>
 
+// Defined in the sketch because the BT-only setup server is intentionally
+// kept out of the full network-services module.  It must still be serviced
+// while a mount UART transaction is waiting for a response.
+extern void serviceTinySetupServer();
+
 #if defined(ESP8266)
 ESP8266WebServer *webServer = nullptr;
 ESP8266WebServer *alpacaServer = nullptr;
@@ -198,7 +203,10 @@ static unsigned long telnetMenuLastPageRefreshMs = 0;
 static unsigned long telnetMenuAutoRefreshMs = 0UL;
 static const uint8_t TELNET_BANNER_ROWS = 5;
 static char telnetBannerCache[TELNET_BANNER_ROWS][160] = {{0}};
-static const unsigned long TELNET_KEEPALIVE_MS = 60000UL;
+// A small Telnet NOP makes half-open clients observable even when the menu is
+// idle. The existing TX stall watchdog then closes the socket if the peer is
+// no longer accepting data, allowing the Web UI and other services to recover.
+static const unsigned long TELNET_KEEPALIVE_MS = 5000UL;
 static const unsigned long TELNET_IDLE_TIMEOUT_MS = 30UL * 60UL * 1000UL;
 
 class TelnetMenuBufferPrint : public Print {
@@ -250,6 +258,7 @@ String wifiModeText = "AP";
 String lastWifiStatus = "AP fallback";
 String startupModeSource = "saved settings";
 int startupModePinUsed = -1;
+bool startupBtForcedByGpio = false;
 
 #if defined(ESP32)
 // WiFi.begin() is asynchronous on ESP32, but repeatedly rebuilding the whole
@@ -261,6 +270,21 @@ static bool wifiReconnectAttemptActive = false;
 static uint8_t wifiReconnectAttemptNumber = 0;
 static unsigned long wifiReconnectNextAttemptMs = 0;
 static unsigned long wifiReconnectAttemptStartedMs = 0;
+static bool wifiInitialStaAttemptActive = false;
+static unsigned long wifiInitialStaAttemptStartedMs = 0;
+
+static void rearmNetworkListenersAfterInitialSTA() {
+  if (webServer && bridgeModeHasWebUi()) {
+    webServer->end();
+    webServer->begin();
+  }
+  if (alpacaServer && bridgeModeHasWifiProtocols()) {
+    alpacaServer->end();
+    alpacaServer->begin();
+  }
+  if (bridgeModeHasWifiProtocols()) startFullNetworkListeners();
+  Serial.printf("[WIFI] Network listeners re-armed after initial STA connection heap=%u\n", ESP.getFreeHeap());
+}
 static const unsigned long WIFI_RECONNECT_ATTEMPT_TIMEOUT_MS = 8000UL;
 static const unsigned long WIFI_RECONNECT_INITIAL_BACKOFF_MS = 1000UL;
 static const unsigned long WIFI_RECONNECT_MAX_BACKOFF_MS = 8000UL;
@@ -272,9 +296,6 @@ const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
 #define GPIO_STARTUP_MODE_ENABLED 1
 #define GPIO_STARTUP_ACTIVE_LOW 1
-#define GPIO_STARTUP_WIFI_NOWEB_PIN 32
-#define GPIO_STARTUP_FULL_WIFI_PIN 33
-#define GPIO_STARTUP_WEB_ONLY_PIN 25
 #define GPIO_STARTUP_BT_PIN 27
 #define GPIO_STARTUP_SAMPLE_DELAY_MS 75
 
@@ -287,6 +308,7 @@ extern String runtimeApSsid();
 extern bool savePersistentSettings();
 extern bool syncTimeFromNTP(bool forceLog);
 extern void serviceNtpSync();
+extern void requestAutomaticApproxLocation();
 extern void telnetDrawMonitor(Print &out);
 extern void telnetStopMonitor(Print &out);
 extern void telnetDrawTasks(Print &out);
@@ -418,11 +440,88 @@ static WiFiServer& telnetServer() {
 
 static const unsigned long TELNET_SOCKET_WRITE_TIMEOUT_MS = 40UL;
 static const unsigned long TELNET_OUTPUT_BUDGET_MS = 250UL;
+static const uint8_t TELNET_INPUT_BUDGET_BYTES = 64;
+static const size_t TELNET_TX_QUEUE_SIZE = 4096;
+static const size_t TELNET_TX_SERVICE_BYTES = 2048;
+static const unsigned long TELNET_TX_QUEUE_STALL_MS = 2000UL;
+
+static uint8_t telnetTxQueue[TELNET_TX_QUEUE_SIZE];
+static size_t telnetTxQueueHead = 0;
+static size_t telnetTxQueueCount = 0;
+static unsigned long telnetTxQueueStartedMs = 0;
+static bool telnetTxQueueFailed = false;
+static bool telnetTxBusyNoticeQueued = false;
+
+static void clearTelnetTxQueue() {
+  telnetTxQueueHead = 0;
+  telnetTxQueueCount = 0;
+  telnetTxQueueStartedMs = 0;
+  telnetTxQueueFailed = false;
+  telnetTxBusyNoticeQueued = false;
+}
+
+static bool telnetTxQueuePending() {
+  return telnetTxQueueCount != 0;
+}
+
+static size_t enqueueTelnetTx(const uint8_t *data, size_t size) {
+  if (telnetTxQueueFailed || !data || !size) return 0;
+  size_t room = TELNET_TX_QUEUE_SIZE - telnetTxQueueCount;
+  size_t accepted = size < room ? size : room;
+  size_t tail = (telnetTxQueueHead + telnetTxQueueCount) % TELNET_TX_QUEUE_SIZE;
+  size_t first = accepted;
+  if (first > TELNET_TX_QUEUE_SIZE - tail) first = TELNET_TX_QUEUE_SIZE - tail;
+  if (first) memcpy(telnetTxQueue + tail, data, first);
+  if (accepted > first) memcpy(telnetTxQueue, data + first, accepted - first);
+  if (accepted) {
+    if (!telnetTxQueueCount) telnetTxQueueStartedMs = millis();
+    telnetTxQueueCount += accepted;
+  }
+  if (accepted != size) telnetTxQueueFailed = true;
+  return accepted;
+}
+
+#if defined(ESP32)
+static bool serviceTelnetTxQueue(WiFiClient &client, size_t byteBudget) {
+  if (!telnetTxQueueCount) return true;
+  const int socketFd = client.fd();
+  if (socketFd < 0 || !client.connected()) {
+    telnetTxQueueFailed = true;
+    return false;
+  }
+
+  size_t sentTotal = 0;
+  while (telnetTxQueueCount && sentTotal < byteBudget) {
+    size_t contiguous = TELNET_TX_QUEUE_SIZE - telnetTxQueueHead;
+    if (contiguous > telnetTxQueueCount) contiguous = telnetTxQueueCount;
+    size_t attempt = contiguous;
+    if (attempt > byteBudget - sentTotal) attempt = byteBudget - sentTotal;
+    int sent = ::send(socketFd, telnetTxQueue + telnetTxQueueHead, attempt, MSG_DONTWAIT);
+    if (sent > 0) {
+      telnetTxQueueHead = (telnetTxQueueHead + (size_t)sent) % TELNET_TX_QUEUE_SIZE;
+      telnetTxQueueCount -= (size_t)sent;
+      sentTotal += (size_t)sent;
+      if (!telnetTxQueueCount) telnetTxQueueStartedMs = 0;
+      continue;
+    }
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      if (millis() - telnetTxQueueStartedMs >= TELNET_TX_QUEUE_STALL_MS) {
+        telnetTxQueueFailed = true;
+        return false;
+      }
+      return true;
+    }
+    telnetTxQueueFailed = true;
+    return false;
+  }
+  return true;
+}
+#endif
 
 class TelnetOutputGuard : public Print {
 public:
   explicit TelnetOutputGuard(WiFiClient &client)
-      : client_(client), stalled_(false) {}
+      : client_(client), stalled_(false), writeBudgetStarted_(false), writeBudgetStartMs_(0) {}
 
   size_t write(uint8_t b) override { return write(&b, 1); }
 
@@ -432,41 +531,9 @@ public:
       return 0;
     }
 #if defined(ESP32)
-    // Arduino-ESP32 NetworkClient::write() can retry a blocked socket for up
-    // to ten one-second select intervals. A Telnet terminal that stops reading
-    // must never stall loopTask, because that also starves the Web/Alpaca and
-    // mount services. Use one nonblocking lwIP send and drop the client on
-    // back-pressure; the next Telnet connection can start cleanly.
-    const int socketFd = client_.fd();
-    if (socketFd < 0) {
-      stalled_ = true;
-      return 0;
-    }
-    // Start the bounded wait when this particular buffered write begins.
-    // Command execution (including a disconnected-mount timeout) can occur
-    // between writes and must not consume the socket-output budget.
-    const unsigned long writeStartedMs = millis();
-    size_t totalSent = 0;
-    while (totalSent < size) {
-      if (millis() - writeStartedMs >= TELNET_OUTPUT_BUDGET_MS) {
-        stalled_ = true;
-        break;
-      }
-      const int sent = ::send(socketFd, data + totalSent, size - totalSent, MSG_DONTWAIT);
-      if (sent > 0) {
-        totalSent += (size_t)sent;
-        continue;
-      }
-      if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        // A short/nonblocking write is expected under normal TCP back-pressure.
-        // Yield briefly and retry instead of treating it as a dead Telnet client.
-        delay(0);
-        continue;
-      }
-      stalled_ = true;
-      break;
-    }
-    return totalSent;
+    size_t accepted = enqueueTelnetTx(data, size);
+    if (accepted != size || telnetTxQueueFailed) stalled_ = true;
+    return accepted;
 #else
     size_t written = client_.write(data, size);
     if (written != size) stalled_ = true;
@@ -480,9 +547,23 @@ public:
 private:
   WiFiClient &client_;
   bool stalled_;
+  bool writeBudgetStarted_;
+  unsigned long writeBudgetStartMs_;
 };
 
 static void dropTelnetClientForOutputStall();
+
+#if defined(ESP32)
+static bool telnetPeerClosed(WiFiClient &client) {
+  const int socketFd = client.fd();
+  if (socketFd < 0) return true;
+  uint8_t probe = 0;
+  int result = ::recv(socketFd, &probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
+  if (result == 0) return true; // orderly FIN from the Telnet peer
+  if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return true;
+  return false;
+}
+#endif
 
 class TelnetCRLFPrint : public Print {
 public:
@@ -747,6 +828,12 @@ void serviceNetworkClients() {
 void serviceNetworkDuringMountWait() {
 #if HAS_CLASSIC_BT
   if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) {
+    // A mount handshake/read can wait up to the configured timeout.  Keep the
+    // BT-only HTTP setup page and Telnet socket alive during that wait, but do
+    // not re-enter handleBluetoothLX200(): the current mount command must
+    // remain the only active mount transaction.
+    serviceTinySetupServer();
+    serviceTelnetConsole();
     delay(1);
     yield();
   }
@@ -864,14 +951,87 @@ static unsigned long wifiReconnectBackoffMs(uint8_t attempt) {
   return delayMs > WIFI_RECONNECT_MAX_BACKOFF_MS ? WIFI_RECONNECT_MAX_BACKOFF_MS : delayMs;
 }
 
+static void beginInitialSTAConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  WiFi.begin(staSsid.c_str(), staPass.c_str());
+  wifiInitialStaAttemptActive = true;
+  wifiInitialStaAttemptStartedMs = millis();
+  staConnected = false;
+  wifiModeText = "STA connecting";
+  lastWifiStatus = "STA connection pending";
+  Serial.printf("[WIFI] Initial STA connection started asynchronously SSID=%s heap=%u\n",
+                staSsid.c_str(), ESP.getFreeHeap());
+  LOG_WIFI_I("Initial STA connection started asynchronously SSID=%s", staSsid.c_str());
+}
+
+static void prepareTimeLocationAfterSTAConnect(const char* eventName, bool syncImmediately = false) {
+  if (!ntpEnabled) {
+    ntpEnabled = true;
+    bool ntpSaveOk = savePersistentSettings();
+    LOG_TIME_I("%s: NTP automatically enabled and persistent save=%s",
+               eventName ? eventName : "STA connected",
+               ntpSaveOk ? "ok" : "failed");
+  }
+  requestAutomaticApproxLocation();
+  if (syncImmediately) syncTimeFromNTP(true);
+}
+
+static bool serviceInitialSTAConnect() {
+  if (!wifiInitialStaAttemptActive) return false;
+
+  const wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    wifiInitialStaAttemptActive = false;
+    wifiReconnectInitialized = true;
+    wifiReconnectWasConnected = true;
+    wifiReconnectAttemptActive = false;
+    wifiReconnectAttemptNumber = 0;
+    staConnected = true;
+    wifiModeText = apRunning ? "STA + AP" : "STA";
+    lastWifiStatus = String("STA connected: ") + WiFi.localIP().toString();
+    Serial.printf("[WIFI] Initial STA connection succeeded, IP=%s\n", WiFi.localIP().toString().c_str());
+    LOG_WIFI_I("Initial STA connection succeeded IP=%s", WiFi.localIP().toString().c_str());
+    saveLastStaIp(WiFi.localIP().toString());
+    prepareTimeLocationAfterSTAConnect("Initial STA connected");
+    rearmNetworkListenersAfterInitialSTA();
+    return true;
+  }
+
+  if ((unsigned long)(millis() - wifiInitialStaAttemptStartedMs) < WIFI_CONNECT_TIMEOUT_MS) return true;
+
+  wifiInitialStaAttemptActive = false;
+  staConnected = false;
+  lastWifiStatus = "STA failed: " + wifiStatusCodeText(status);
+  Serial.printf("[WIFI] Initial STA connection timed out status=%s; switching to AP fallback\n",
+                wifiStatusCodeText(status).c_str());
+  LOG_WIFI_W("Initial STA connection timed out status=%s; switching to AP fallback",
+             wifiStatusCodeText(status).c_str());
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  startFallbackAP();
+  wifiModeText = "AP fallback";
+  rearmNetworkListenersAfterInitialSTA();
+  wifiReconnectInitialized = true;
+  wifiReconnectWasConnected = false;
+  wifiReconnectAttemptActive = false;
+  return true;
+}
+
 void serviceWiFiReconnect() {
   if (!wifiRuntimeEnabled || staRuntimeDisabled || !staConfigured || staSsid.length() == 0) {
+    wifiInitialStaAttemptActive = false;
     wifiReconnectInitialized = true;
     wifiReconnectWasConnected = false;
     wifiReconnectAttemptActive = false;
     staConnected = false;
     return;
   }
+
+  if (serviceInitialSTAConnect()) return;
 
   const wl_status_t status = WiFi.status();
   const bool connected = status == WL_CONNECTED;
@@ -882,6 +1042,8 @@ void serviceWiFiReconnect() {
     staConnected = connected;
     if (connected) {
       lastWifiStatus = String("STA connected: ") + WiFi.localIP().toString();
+      wifiModeText = apRunning ? "STA + AP" : "STA";
+      prepareTimeLocationAfterSTAConnect("STA already connected");
     }
     return;
   }
@@ -893,10 +1055,12 @@ void serviceWiFiReconnect() {
     wifiReconnectAttemptNumber = 0;
     staConnected = true;
     lastWifiStatus = String("STA connected: ") + WiFi.localIP().toString();
+    wifiModeText = apRunning ? "STA + AP" : "STA";
     if (recovered) {
       Serial.printf("[WIFI] STA reconnect succeeded, IP=%s heap=%u\n",
                     WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
       LOG_WIFI_I("STA reconnect succeeded IP=%s", WiFi.localIP().toString().c_str());
+      prepareTimeLocationAfterSTAConnect("STA reconnect succeeded");
       // The Async HTTP listeners remain registered across a link flap. The
       // small protocol listeners need begin() again to re-arm their sockets.
       if (bridgeModeHasWifiProtocols()) startFullNetworkListeners();
@@ -1023,17 +1187,15 @@ void runtimeWifiOn() {
 
 const char* bridgeModeName() {
   if (bridgeMode == BRIDGE_MODE_BT_MIN_WEB) return "BT Telnet mode";
-  if (bridgeMode == BRIDGE_MODE_WIFI_SERVERS) return "WiFi servers / no Web UI";
-  if (bridgeMode == BRIDGE_MODE_WEB_ONLY) return "Web UI only";
   return "Full WiFi web";
 }
 
 bool bridgeModeHasWebUi() {
-  return bridgeMode == BRIDGE_MODE_WIFI_FULL || bridgeMode == BRIDGE_MODE_WEB_ONLY;
+  return bridgeMode == BRIDGE_MODE_WIFI_FULL;
 }
 
 bool bridgeModeHasWifiProtocols() {
-  return bridgeMode == BRIDGE_MODE_WIFI_FULL || bridgeMode == BRIDGE_MODE_WIFI_SERVERS;
+  return bridgeMode == BRIDGE_MODE_WIFI_FULL;
 }
 
 static bool readStartupModePinActive(int pin) {
@@ -1055,57 +1217,30 @@ static bool readStartupModePinActive(int pin) {
 
 void applyGpioStartupModeOverride() {
 #if defined(ESP32)
+  bridgeMode = BRIDGE_MODE_WIFI_FULL;
+  startupBtForcedByGpio = false;
   if (!GPIO_STARTUP_MODE_ENABLED) {
-    startupModeSource = "saved settings";
+    startupModeSource = "canonical Full WiFi startup";
     startupModePinUsed = -1;
-    return;
-  }
-
-  if (readStartupModePinActive(GPIO_STARTUP_WIFI_NOWEB_PIN)) {
-    bridgeMode = BRIDGE_MODE_WIFI_SERVERS;
-    btLiteBootWebEnabled = false;
-    setBluetoothTinyWebRuntimeEnabled(false);
-    startupModeSource = "GPIO force WiFi servers / no Web UI";
-    startupModePinUsed = GPIO_STARTUP_WIFI_NOWEB_PIN;
-    Serial.printf("[BOOT] GPIO startup override: GPIO%d active -> WiFi servers / no Web UI\n", startupModePinUsed);
-    return;
-  }
-
-  if (readStartupModePinActive(GPIO_STARTUP_FULL_WIFI_PIN)) {
-    bridgeMode = BRIDGE_MODE_WIFI_FULL;
-    btLiteBootWebEnabled = true;
-    setBluetoothTinyWebRuntimeEnabled(true);
-    startupModeSource = "GPIO force Full WiFi";
-    startupModePinUsed = GPIO_STARTUP_FULL_WIFI_PIN;
-    Serial.printf("[BOOT] GPIO startup override: GPIO%d active -> Full WiFi web mode\n", startupModePinUsed);
-    return;
-  }
-
-  if (readStartupModePinActive(GPIO_STARTUP_WEB_ONLY_PIN)) {
-    bridgeMode = BRIDGE_MODE_WEB_ONLY;
-    btLiteBootWebEnabled = false;
-    setBluetoothTinyWebRuntimeEnabled(false);
-    startupModeSource = "GPIO force Web UI only";
-    startupModePinUsed = GPIO_STARTUP_WEB_ONLY_PIN;
-    Serial.printf("[BOOT] GPIO startup override: GPIO%d active -> Web UI only\n", startupModePinUsed);
     return;
   }
 
   if (readStartupModePinActive(GPIO_STARTUP_BT_PIN)) {
     bridgeMode = BRIDGE_MODE_BT_MIN_WEB;
-    btLiteBootWebEnabled = true;
-    setBluetoothTinyWebRuntimeEnabled(true);
-    startupModeSource = "GPIO force BT Telnet mode";
+    startupBtForcedByGpio = true;
+    startupModeSource = "GPIO27 grounded: forced Bluetooth-only startup";
     startupModePinUsed = GPIO_STARTUP_BT_PIN;
-    Serial.printf("[BOOT] GPIO startup override: GPIO%d active -> BT Telnet mode\n", startupModePinUsed);
+    Serial.printf("[BOOT] GPIO startup override: GPIO%d grounded -> forced Bluetooth-only startup\n", startupModePinUsed);
     return;
   }
 
-  startupModeSource = "saved settings";
+  startupModeSource = "canonical Full WiFi startup";
   startupModePinUsed = -1;
-  Serial.println("[BOOT] GPIO startup override: no startup mode pin active; using saved settings");
+  Serial.println("[BOOT] GPIO startup override: GPIO27 inactive; using canonical Full WiFi startup");
 #else
-  startupModeSource = "saved settings";
+  bridgeMode = BRIDGE_MODE_WIFI_FULL;
+  startupBtForcedByGpio = false;
+  startupModeSource = "canonical Full WiFi startup";
   startupModePinUsed = -1;
 #endif
 }
@@ -1126,32 +1261,13 @@ String gpioStartupModeText() {
   s += "Active level: ";
   s += GPIO_STARTUP_ACTIVE_LOW ? "grounded / LOW" : "HIGH";
   s += "\n";
-  s += "Current bridge mode: ";
-  s += bridgeModeName();
-  s += "\n";
-  s += "Pin map:\n";
-  s += "  GPIO";
-  s += String(GPIO_STARTUP_WIFI_NOWEB_PIN);
-  s += " -> mode wifi noweb WiFi protocol servers; Web UI disabled\n";
-  s += "  GPIO";
-  s += String(GPIO_STARTUP_FULL_WIFI_PIN);
-  s += " -> mode wifi       Full WiFi: Web UI + Telnet + SkySafari + Alpaca + Stellarium\n";
-  s += "  GPIO";
-  s += String(GPIO_STARTUP_WEB_ONLY_PIN);
-  s += " -> mode web        Web UI + Telnet only; SkySafari, Alpaca, and Stellarium disabled\n";
-  s += "  GPIO";
+  s += "Startup policy: Bluetooth window for 60 seconds, then Full WiFi.\n";
+  s += "GPIO";
   s += String(GPIO_STARTUP_BT_PIN);
-  s += " -> mode bt         Bluetooth SkySafari + Telnet setup AP only\n";
-  s += "Priority if multiple pins are active: GPIO";
-  s += String(GPIO_STARTUP_WIFI_NOWEB_PIN);
-  s += ", then GPIO";
-  s += String(GPIO_STARTUP_FULL_WIFI_PIN);
-  s += ", then GPIO";
-  s += String(GPIO_STARTUP_WEB_ONLY_PIN);
-  s += ", then GPIO";
-  s += String(GPIO_STARTUP_BT_PIN);
+  s += " grounded: force Bluetooth-only until reset.\n";
+  s += "Current startup path: ";
+  s += startupModeSource;
   s += "\n";
-  s += "Saved mode is used when no startup GPIO pin is active.\n";
 #else
   s += "GPIO startup override: unavailable on this board\n";
 #endif
@@ -1215,17 +1331,11 @@ bool connectConfiguredSTA() {
     if (s == WL_CONNECTED) {
       staConnected = true;
       lastWifiStatus = "STA connected";
-      wifiModeText = apRunning ? "STA-only/AP-only" : "STA";
+      wifiModeText = apRunning ? "STA + AP" : "STA";
       LOG_WIFI_I("STA connected: SSID=%s IP=%s RSSI=%d", staSsid.c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
       saveLastStaIp(WiFi.localIP().toString());
 
-      if (!ntpEnabled) {
-        ntpEnabled = true;
-        bool ntpSaveOk = savePersistentSettings();
-        LOG_TIME_I("STA connected: NTP automatically enabled and persistent save=%s",
-                   ntpSaveOk ? "ok" : "failed");
-      }
-      syncTimeFromNTP(true);
+      prepareTimeLocationAfterSTAConnect("STA connected", true);
       return true;
     }
 
@@ -1244,6 +1354,7 @@ bool connectConfiguredSTA() {
 
 void setupWiFiFromSavedConfig() {
 #if defined(ESP32)
+  wifiInitialStaAttemptActive = false;
   wifiReconnectInitialized = false;
   wifiReconnectWasConnected = false;
   wifiReconnectAttemptActive = false;
@@ -1267,22 +1378,15 @@ void setupWiFiFromSavedConfig() {
     delay(100);
 #endif
     wifiModeText = "STA only";
-    lastWifiStatus = "Trying STA-only connection";
+    lastWifiStatus = "Trying STA-only connection asynchronously";
     Serial.printf("[WIFI] Exclusive mode: STA-only, SSID=%s\n", staSsid.c_str());
-
-    connectConfiguredSTA();
-
-    if (WiFi.status() == WL_CONNECTED) {
-      staConnected = true;
-      apRunning = false;
-      wifiModeText = "STA only";
-      lastWifiStatus = String("STA connected: ") + WiFi.localIP().toString();
-      Serial.printf("[WIFI] STA-only connected, IP=%s\n", WiFi.localIP().toString().c_str());
-      return;
-    }
-
-    Serial.println("[WIFI] STA-only failed; switching to AP-only fallback");
 #if defined(ESP32)
+    beginInitialSTAConnect();
+    return;
+#else
+    connectConfiguredSTA();
+    if (WiFi.status() == WL_CONNECTED) return;
+    Serial.println("[WIFI] STA-only failed; switching to AP-only fallback");
     WiFi.disconnect(true, true);
     delay(150);
     WiFi.mode(WIFI_OFF);
@@ -1428,6 +1532,7 @@ void handleStellariumServer() {
 
   static uint8_t stellariumRxBuf[64];
   static uint8_t stellariumRxLen = 0;
+  static const uint8_t STELLARIUM_PACKET_BUDGET = 2;
 
   while (stellariumClient.available() > 0 && stellariumRxLen < sizeof(stellariumRxBuf)) {
     int ch = stellariumClient.read();
@@ -1435,7 +1540,8 @@ void handleStellariumServer() {
     stellariumRxBuf[stellariumRxLen++] = (uint8_t)ch;
   }
 
-  while (stellariumRxLen >= 2) {
+  uint8_t packetBudget = STELLARIUM_PACKET_BUDGET;
+  while (packetBudget-- > 0 && stellariumRxLen >= 2) {
     uint16_t len = readLE16Network(stellariumRxBuf);
 
     if (len < 4 || len > sizeof(stellariumRxBuf)) {
@@ -1545,7 +1651,7 @@ static TelnetMenuControlKind menuControlKind(uint8_t screen, uint8_t index) {
   if (screen == 3) {
     if (index <= 2) return TM_CONTROL_NUMBER;
     if (index == 3) return TM_CONTROL_CHECKBOX;
-    if (index == 8) return TM_CONTROL_BACK;
+    if (index == 7) return TM_CONTROL_BACK;
     return TM_CONTROL_ACTION;
   }
   if (screen == 4) {
@@ -1577,18 +1683,17 @@ static const char *screenTitle(uint8_t screen) {
 static uint8_t parentScreen(uint8_t screen){ if(screen==6)return 1; if(screen>=1&&screen<=5)return 0; return telnetMenuReturnScreen; }
 static const char *menuLabel(uint8_t screen, uint8_t index) {
   static const char *main[] = {"Control", "Status", "Setup", "Logs", "Advanced", "Exit to Telnet prompt"};
-  static const char *control[] = {"Read RA/Dec", "Read Alt/Az", "Manual Nudge", "GOTO RA/Dec", "GOTO Alt/Az", "Catalog GOTO (Web UI)", "Mount initialization test", "Drain mount input", "Back"};
+  static const char *control[] = {"Read RA/Dec", "Read Alt/Az", "Manual Nudge", "GOTO RA/Dec", "GOTO Alt/Az", "Mount initialization test", "Drain mount input", "Back"};
   static const char *status[] = {"Observer Status - Basic", "System Health - Basic", "Observer Status - Advanced", "System Health - Advanced", "Network Status", "Time / Location", "Protocols / Ports", "FreeRTOS Tasks", "Back"};
-  static const char *setup[] = {"Active mount poll", "Idle mount poll", "Status auto-refresh interval", "Telnet live logging", "", "Time / Location (Web UI)", "NTP (Web UI)", "Safety limits / rates (Web UI)", "Back"};
+  static const char *setup[] = {"Active mount poll", "Idle mount poll", "Status auto-refresh interval", "Telnet live logging", "Time / Location (Web UI)", "NTP (Web UI)", "Safety limits / rates (Web UI)", "Back"};
   static const char *logs[] = {"Errors only", "Warnings", "Information", "Debug", "Trace", "Toggle live Telnet logs", "Back"};
   static const char *adv[] = {"GPIO startup pins", "Telnet status", "Restart controller", "Restore AP defaults", "Back"};
   static const char *nudge[] = {"Azimuth +", "Azimuth -", "Altitude +", "Altitude -", "Back"};
   const char **a=nullptr; uint8_t n=0;
-  switch(screen){case 0:a=main;n=6;break;case 1:a=control;n=9;break;case 2:a=status;n=9;break;case 3:a=setup;n=9;break;case 4:a=logs;n=7;break;case 5:a=adv;n=5;break;case 6:a=nudge;n=5;break;}
-  if(screen==3 && index==4) return bridgeMode==BRIDGE_MODE_WIFI_FULL ? "Switch to BT Telnet mode" : "Switch to Full WiFi mode";
+  switch(screen){case 0:a=main;n=6;break;case 1:a=control;n=8;break;case 2:a=status;n=9;break;case 3:a=setup;n=8;break;case 4:a=logs;n=7;break;case 5:a=adv;n=5;break;case 6:a=nudge;n=5;break;}
   return (a && index<n)?a[index]:"";
 }
-static uint8_t menuCount(uint8_t screen) { switch(screen){case 0:return 6;case 1:return 9;case 2:return 9;case 3:return 9;case 4:return 7;case 5:return 5;case 6:return 5;default:return 0;} }
+static uint8_t menuCount(uint8_t screen) { switch(screen){case 0:return 6;case 1:return 8;case 2:return 9;case 3:return 8;case 4:return 7;case 5:return 5;case 6:return 5;default:return 0;} }
 
 static void drawBorder(Print &out,uint16_t row,const char *left,const char *fill,const char *right){vtCursor(out,row,1);out.print(left);for(uint16_t i=0;i<uiWidth()-2;i++)out.print(fill);out.print(right);}
 static void breadcrumb(char *buf,size_t size){
@@ -1748,28 +1853,18 @@ static void drawTitleActionRow(Print &out) {
   const uint16_t w = uiWidth();
   vtCursor(out,2,1); out.print(gV());
   char title[96];
-  const char *modeText = bridgeMode == BRIDGE_MODE_WIFI_FULL ? "BT" : "WiFi";
-  snprintf(title, sizeof(title), " NexStar Protocol Converter %s", FW_VERSION);
+  snprintf(title, sizeof(title), " %s %s", FW_NAME, FW_VERSION);
 
   const int inner = (int)w - 2;
   const char rebootText[] = "[ Reboot ]";
-  char modeButton[16];
-  snprintf(modeButton, sizeof(modeButton), "[ %s ]", modeText);
   const int rebootLen = (int)strlen(rebootText);
-  const int modeLen = (int)strlen(modeButton);
-  const int gap = 2;
-  const int buttonsLen = rebootLen + gap + modeLen;
-  int titleWidth = inner - buttonsLen;
+  int titleWidth = inner - rebootLen;
   if (titleWidth < 1) titleWidth = 1;
 
   out.printf("%-*.*s", titleWidth, titleWidth, title);
   if (telnetMenuFocus == 1) vtSelected(out);
   out.print(rebootText);
   if (telnetMenuFocus == 1) { vtReset(out); vtTitle(out); }
-  out.print("  ");
-  if (telnetMenuFocus == 2) vtSelected(out);
-  out.print(modeButton);
-  if (telnetMenuFocus == 2) { vtReset(out); vtTitle(out); }
   out.print(gV());
 }
 
@@ -1790,7 +1885,6 @@ static void drawFooter(Print &out, const char *message=nullptr) {
   if(telnetMenuScreen==8) hint=telnetMenuPageRefreshable ? "Up/Down Scroll  r Refresh  Enter Refresh  Space/N Page  P Previous  Left/q Back" : "Up/Down Scroll  Space/N Page  P Previous  Left/q Back";
   else if(telnetMenuScreen==7) hint="Y Confirm  N/Esc/Left Cancel";
   else if(telnetMenuFocus==1) hint="Tab/Shift-Tab Focus  Enter/Space Reboot  q Back  ? Help";
-  else if(telnetMenuFocus==2) hint="Tab/Shift-Tab Focus  Enter/Space Switch Mode  q Back  ? Help";
   else {
     TelnetMenuControlKind kind = menuControlKind(telnetMenuScreen, telnetMenuSelection);
     if(kind==TM_CONTROL_CHECKBOX) hint="Tab/Shift-Tab Focus  Space Toggle  Up/Down Navigate  Left/q Back  ? Help";
@@ -1970,10 +2064,6 @@ static void captureMenuCommand(const char *cmd){
     capture.println("Use the Telnet prompt command:");
     capture.println("  goto altaz <altitude degrees -90..90> <azimuth degrees 0..360)");
     capture.println("The same horizon/altitude safety checks and async GOTO queue are used as the Web UI.");
-  } else if (strcmp(cmd,"menu_catalog_help")==0) {
-    capture.println("Catalog GOTO remains a Web UI action.");
-    capture.println("The browser owns the catalog search, nearby-object list, and BSC5 loading state.");
-    capture.println("Select an object in Web Control -> Catalog Goto, then choose Slew to Object.");
   } else if (strcmp(cmd,"menu_setup_time_help")==0) {
     capture.println("Observer Setup parity: Site / Time / Polling");
     capture.println("The Web Setup page is required for entering coordinates, date/time, client throttle, and GPS Sync.");
@@ -2278,7 +2368,7 @@ static bool adjustFocusedNumber(Print &out,int direction) {
 
 static void selectMenu(Print &out){telnetMenuFocus=0;
   if(telnetMenuScreen==0){if(telnetMenuSelection<5){telnetMenuScreen=telnetMenuSelection+1;telnetMenuSelection=0;drawMenu(out,true);}else{telnetStopMenu(out);if(telnetClient&&telnetClient.connected())out.print("> ");}return;}
-  if(telnetMenuScreen==1){const char* cmds[]={"get","getaltaz",nullptr,"menu_goto_radec_help","menu_goto_altaz_help","menu_catalog_help","testinit","drain",nullptr};if(telnetMenuSelection==2){telnetMenuScreen=6;telnetMenuSelection=0;drawMenu(out,true);}else if(telnetMenuSelection==8)backMenu(out);else showCommand(out,menuLabel(1,telnetMenuSelection),cmds[telnetMenuSelection]);return;}
+  if(telnetMenuScreen==1){const char* cmds[]={"get","getaltaz",nullptr,"menu_goto_radec_help","menu_goto_altaz_help","testinit","drain",nullptr};if(telnetMenuSelection==2){telnetMenuScreen=6;telnetMenuSelection=0;drawMenu(out,true);}else if(telnetMenuSelection==7)backMenu(out);else showCommand(out,menuLabel(1,telnetMenuSelection),cmds[telnetMenuSelection]);return;}
   if(telnetMenuScreen==2){
     if(telnetMenuSelection==8){backMenu(out);return;}
     const char *cmd=nullptr;
@@ -2295,17 +2385,17 @@ static void selectMenu(Print &out){telnetMenuFocus=0;
     if(cmd) showCommand(out,menuLabel(2,telnetMenuSelection),cmd);
     return;
   }
-  if(telnetMenuScreen==3){if(telnetMenuSelection<=2)adjustFocusedNumber(out,+1);else if(telnetMenuSelection==3)toggleFocusedCheckbox(out);else if(telnetMenuSelection==4){if(bridgeMode==BRIDGE_MODE_WIFI_FULL)showConfirm(out,"Bluetooth mode","Save BT + WiFi Telnet mode and reboot?","mode bt");else showConfirm(out,"Full WiFi mode","Save Full WiFi mode and reboot?","mode wifi");}else if(telnetMenuSelection==5)showCommand(out,menuLabel(3,telnetMenuSelection),"menu_setup_time_help");else if(telnetMenuSelection==6)showCommand(out,menuLabel(3,telnetMenuSelection),"menu_setup_ntp_help");else if(telnetMenuSelection==7)showCommand(out,menuLabel(3,telnetMenuSelection),"menu_setup_safety_help");else backMenu(out);return;}
+  if(telnetMenuScreen==3){if(telnetMenuSelection<=2)adjustFocusedNumber(out,+1);else if(telnetMenuSelection==3)toggleFocusedCheckbox(out);else if(telnetMenuSelection==4)showCommand(out,menuLabel(3,telnetMenuSelection),"menu_setup_time_help");else if(telnetMenuSelection==5)showCommand(out,menuLabel(3,telnetMenuSelection),"menu_setup_ntp_help");else if(telnetMenuSelection==6)showCommand(out,menuLabel(3,telnetMenuSelection),"menu_setup_safety_help");else backMenu(out);return;}
   if(telnetMenuScreen==4){if(telnetMenuSelection<=4){uint8_t oldLevel=LOG_LEVEL;LOG_LEVEL=telnetMenuSelection+1;if(oldLevel>=1&&oldLevel<=5)drawRow(out,oldLevel-1,oldLevel-1==telnetMenuSelection);drawRow(out,telnetMenuSelection,true);drawFooter(out,"Log level changed");}else if(telnetMenuSelection==5)toggleFocusedCheckbox(out);else backMenu(out);return;}
   if(telnetMenuScreen==5){const char* cmds[]={"gpio_startup","telnet status",nullptr,"apdefault"};if(telnetMenuSelection==2)showConfirm(out,"Restart controller",bridgeMode==BRIDGE_MODE_BT_MIN_WEB?"Restart now? BT mode will return with Telnet only; no web interface.":"Restart now?","reboot");else if(telnetMenuSelection==3)showConfirm(out,"Restore AP defaults","Restore AP defaults and reboot?","apdefault");else if(telnetMenuSelection==4)backMenu(out);else showCommand(out,menuLabel(5,telnetMenuSelection),cmds[telnetMenuSelection]);return;}
   if(telnetMenuScreen==6){const char* cmds[]={"nudge az+","nudge az-","nudge alt+","nudge alt-"};if(telnetMenuSelection==4)backMenu(out);else showCommand(out,"Manual Nudge",cmds[telnetMenuSelection]);}
 }
 
-void telnetStartMenu(Print &out){telnetMenuHeapDiag("menu-before");if(!telnetMenuHeapAllowed(out))return;memset(telnetBannerCache,0,sizeof(telnetBannerCache));telnetMenuLastPageRefreshMs=millis();telnetMenuWindowsCompat=true;telnetMenuUtf8=false;telnetMenuSavedLiveLog=telnetLiveLogEnabled;telnetLiveLogEnabled=false;telnetMonitorActive=false;telnetTasksActive=false;telnetMenuActive=true;telnetMenuScreen=0;telnetMenuSelection=0;telnetMenuFocus=0;telnetMenuEscapeState=0;telnetMenuEscapeParam=0;telnetMenuEscapeHasParam=false;telnetMenuNumericLength=0;telnetMenuNumericPrefix[0]=0;telnetMenuIgnoreNextLf=telnetLastWasCR;vtAltOn(out);drawMenu(out,true);telnetMenuHeapDiag("menu-after");}
+void telnetStartMenu(Print &out){telnetMenuHeapDiag("menu-before");if(!telnetMenuHeapAllowed(out))return;memset(telnetBannerCache,0,sizeof(telnetBannerCache));telnetMenuLastPageRefreshMs=millis();telnetMenuWindowsCompat=true;telnetMenuUtf8=false;telnetMenuSavedLiveLog=telnetLiveLogEnabled;telnetLiveLogEnabled=false;telnetMonitorActive=false;telnetTasksActive=false;telnetMenuActive=true;telnetMenuScreen=0;telnetMenuSelection=0;telnetMenuFocus=0;telnetMenuEscapeState=0;telnetMenuEscapeParam=0;telnetMenuEscapeHasParam=false;telnetMenuNumericLength=0;telnetMenuNumericPrefix[0]=0;telnetMenuIgnoreNextLf=telnetLastWasCR;vtAltOn(out);drawMenu(out,true);drawFooter(out,"WARNING: Full-screen menu uses extra heap and may affect stability.");telnetMenuHeapDiag("menu-after");}
 void telnetStopMenu(Print &out){telnetMenuActive=false;telnetLiveLogEnabled=telnetMenuSavedLiveLog;telnetMenuEscapeState=0;telnetMenuIgnoreNextLf=false;telnetMenuNumericLength=0;telnetMenuNumericPrefix[0]=0;vtResetScroll(out);vtShowCursor(out);vtReset(out);vtAltOff(out);if(telnetMenuWindowsCompat)vtClear(out);out.println("Menu closed. Type menu to reopen it.");}
 
 static void setMenuFocus(Print &out, uint8_t newFocus) {
-  newFocus %= 3;
+  newFocus %= 2;
   uint8_t oldFocus = telnetMenuFocus;
   if (oldFocus == newFocus) return;
   telnetMenuFocus = newFocus;
@@ -2319,8 +2409,8 @@ static void setMenuFocus(Print &out, uint8_t newFocus) {
 
 static void cycleMenuFocus(Print &out, int direction) {
   int next = (int)telnetMenuFocus + direction;
-  while (next < 0) next += 3;
-  while (next >= 3) next -= 3;
+  while (next < 0) next += 2;
+  while (next >= 2) next -= 2;
   setMenuFocus(out, (uint8_t)next);
 }
 
@@ -2331,13 +2421,6 @@ static bool activateHeaderFocus(Print &out) {
                   ? "Restart now? BT mode will return with Telnet only; no web interface."
                   : "Restart now?",
                 "reboot");
-    return true;
-  }
-  if (telnetMenuFocus == 2) {
-    if (bridgeMode == BRIDGE_MODE_WIFI_FULL)
-      showConfirm(out, "Bluetooth mode", "Save BT + WiFi Telnet mode and reboot?", "mode bt");
-    else
-      showConfirm(out, "Full WiFi mode", "Save Full WiFi mode and reboot?", "mode wifi");
     return true;
   }
   return false;
@@ -2430,6 +2513,7 @@ static void dropTelnetClientForOutputStall() {
   telnetRedTextEnabled = false;
   telnetPendingConfirmCommand = "";
   telnetPendingConfirmDescription = "";
+  clearTelnetTxQueue();
 }
 
 void stopTelnetConsoleServer(const char* reason) {
@@ -2622,6 +2706,7 @@ void serviceTelnetConsole() {
     WiFiClient nc = telnetServer().available();
     if (nc) {
       telnetClient = nc;
+      clearTelnetTxQueue();
       // Disable Nagle for immediate key-response packets. Screen output is still
       // efficiently coalesced by TelnetCRLFPrint's 512-byte buffer.
       telnetClient.setNoDelay(true);
@@ -2634,6 +2719,7 @@ void serviceTelnetConsole() {
       telnetTasksActive = false;
       telnetMenuActive = false;
       telnetLastRxMs = millis();
+      telnetLastKeepaliveMs = telnetLastRxMs;
       TelnetOutputGuard socketOut(telnetClient);
       TelnetCRLFPrint telnetOut(socketOut);
       telnetIacState = 0; telnetTermWidth = 80; telnetTermHeight = 24; telnetNawsReceived = false;
@@ -2661,8 +2747,60 @@ void serviceTelnetConsole() {
   TelnetOutputGuard socketOut(telnetClient);
   TelnetCRLFPrint telnetOut(socketOut);
 
-  while (telnetClient.available()) {
+  if (telnetPeerClosed(telnetClient)) {
+    Serial.println("[telnet] peer closed; releasing client and menu state");
+    dropTelnetClientForOutputStall();
+    return;
+  }
+
+  const unsigned long nowMs = millis();
+  if (telnetMenuActive && telnetLastRxMs &&
+      nowMs - telnetLastRxMs >= TELNET_IDLE_TIMEOUT_MS) {
+    Serial.println("[telnet] menu idle timeout; dropping client");
+    dropTelnetClientForOutputStall();
+    return;
+  }
+
+  // RFC 854 NOP is queued through the same bounded, nonblocking path as
+  // screen output. This lets the existing output-stall limit detect a
+  // half-open connection without blocking the main loop.
+  if (!telnetTxQueuePending() &&
+      nowMs - telnetLastKeepaliveMs >= TELNET_KEEPALIVE_MS) {
+    const uint8_t keepalive[] = {255, 241}; // IAC NOP
+    if (enqueueTelnetTx(keepalive, sizeof(keepalive)) == sizeof(keepalive)) {
+      telnetLastKeepaliveMs = nowMs;
+    }
+  }
+
+  // Drain queued screen/command output in bounded chunks. While output is
+  // pending, pause input so a fast key burst cannot enqueue another redraw
+  // behind a slow terminal.
+  if (!serviceTelnetTxQueue(telnetClient, TELNET_TX_SERVICE_BYTES)) {
+    dropTelnetClientForOutputStall();
+    return;
+  }
+  if (telnetTxQueuePending()) {
+    // Do not let pipelined commands or a burst of menu keys accumulate behind
+    // a redraw. The terminal must wait for the next prompt/paint completion.
+    uint8_t discarded = 0;
+    while (discarded < TELNET_INPUT_BUDGET_BYTES && telnetClient.available()) {
+      telnetClient.read();
+      discarded++;
+    }
+    if (discarded && !telnetTxBusyNoticeQueued) {
+      static const char busyNotice[] = "\r\n[Telnet busy; wait for prompt]\r\n";
+      if (enqueueTelnetTx((const uint8_t *)busyNotice, sizeof(busyNotice) - 1) == sizeof(busyNotice) - 1) {
+        telnetTxBusyNoticeQueued = true;
+      }
+    }
+    return;
+  }
+  telnetTxBusyNoticeQueued = false;
+
+  uint8_t inputBudget = TELNET_INPUT_BUDGET_BYTES;
+  while (inputBudget-- > 0 && telnetClient.available()) {
     uint8_t ch = (uint8_t)telnetClient.read();
+    telnetLastRxMs = millis();
 
     uint8_t appByte = 0;
     if (!telnetParseByte(ch, appByte)) continue;
@@ -2670,7 +2808,10 @@ void serviceTelnetConsole() {
 
     if (telnetMenuActive) {
       handleMenuByte(ch, telnetOut);
-      continue;
+      // A menu key can redraw the whole screen. Yield after one key so a
+      // pasted escape sequence or key burst cannot perform many redraws in
+      // one loop pass.
+      break;
     }
 
     if (telnetMonitorActive) {
@@ -2757,7 +2898,9 @@ void serviceTelnetConsole() {
         telnetOut.print("> ");
         telnetRenderedLineLength = 0;
       }
-      continue;
+      // Command execution may format status or perform a mount transaction.
+      // Return to the main loop before accepting another complete command.
+      break;
     }
 
     if (ch == 8 || ch == 127) {
@@ -2792,7 +2935,7 @@ void serviceTelnetConsole() {
     telnetDrawTasks(telnetOut);
   }
   telnetOut.flush();
-  if (socketOut.stalled()) dropTelnetClientForOutputStall();
+  if (socketOut.stalled() || !serviceTelnetTxQueue(telnetClient, TELNET_TX_SERVICE_BYTES)) dropTelnetClientForOutputStall();
 #endif
 }
 

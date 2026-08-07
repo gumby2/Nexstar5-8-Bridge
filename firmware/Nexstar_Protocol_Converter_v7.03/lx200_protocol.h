@@ -19,14 +19,17 @@ extern unsigned long lx200BtLastTxMs;
 extern uint32_t lx200BtRxCommands;
 extern uint32_t lx200BtTxReplies;
 extern uint32_t lx200BtUnhandledCommands;
+extern uint32_t lx200BtNoReplyCommands;
 extern String lx200BtLastCommand;
 extern String lx200BtLastReply;
 extern String lx200BtLastUnhandled;
+extern String lx200BtLastNoReplyCommand;
 extern bool lx200SuppressNextReplyLog;
 extern uint32_t lx200BtGotoStageCommands;
 extern uint32_t lx200BtPollOnlyHintCount;
 extern uint32_t lx200CommonRouterCommands;
 extern unsigned long lx200BtLastCommandHandledMs;
+void bluetoothRecordLX200Rx(const String &s);
 
 const char* lx200SourceName(uint8_t source);
 bool lx200SourceIsPollCommand(const String &cmd);

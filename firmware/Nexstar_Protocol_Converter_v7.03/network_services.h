@@ -75,6 +75,7 @@ extern String wifiModeText;
 extern String lastWifiStatus;
 extern String startupModeSource;
 extern int startupModePinUsed;
+extern bool startupBtForcedByGpio;
 
 extern const uint16_t HTTP_WEB_PORT;
 extern const uint16_t ALPACA_DISCOVERY_PORT;

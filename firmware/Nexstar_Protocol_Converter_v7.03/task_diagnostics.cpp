@@ -97,7 +97,6 @@ String basicSystemHealthText() {
   s += "Handshake timeout: " + String(mountHandshakeTimeoutMs) + " ms\n";
   s += "Poll latency current/max: " + String(lastPollSchedulerLatencyMs) + "/" + String(maxPollSchedulerLatencyMs) + " ms\n";
   s += "Missed poll deadlines: " + String(mountPollsMissedDeadline) + "\n";
-  s += "Mount uptime: " + formatMountUptime() + " h:mm\n";
   s += "Loop latency current/max: " + String(lastLoopLatencyMs) + "/" + String(maxLoopLatencyMs) + " ms\n";
   s += "\nRELIABILITY\n";
   s += "Poll failures: " + String(backgroundPollFailCount) + "\n";
@@ -110,7 +109,16 @@ String basicSystemHealthText() {
 #endif
   s += "\nNETWORK\n";
   s += "Mode: " + wifiModeText + " / " + String(bridgeModeName()) + "\n";
-  s += "STA: " + String(staConnected && WiFi.status() == WL_CONNECTED ? "connected" : "not connected") + "\n";
+  const bool staIsConnected = staConnected && WiFi.status() == WL_CONNECTED;
+  s += "STA: " + String(staIsConnected ? "connected" : "not connected") + "\n";
+  s += "STA SSID: " + staSsid + "\n";
+  s += "STA IP: " + WiFi.localIP().toString() + "\n";
+  s += "STA MAC: " + WiFi.macAddress() + "\n";
+  s += "STA RSSI: " + String(staIsConnected ? WiFi.RSSI() : 0) + " dBm\n";
+  s += "WiFi status: " + String((int)WiFi.status()) + " / " + lastWifiStatus + "\n";
+  s += "AP IP: " + WiFi.softAPIP().toString() + "\n";
+  s += "AP MAC: " + WiFi.softAPmacAddress() + "\n";
+  s += "AP clients: " + String(WiFi.softAPgetStationNum()) + "\n";
   return s;
 }
 
@@ -231,7 +239,7 @@ String taskStatsSectionText(bool basicMode) {
   String s;
   s += basicMode ? "TASKS\n" : "=== TASKS ===\n";
   s += "Task            Abs Time      % Time\n";
-#if defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
+#if !defined(NEXSTAR_DIAGNOSTIC_LIGHT) && defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
   static char taskStats[2048];
   memset(taskStats, 0, sizeof(taskStats));
   vTaskGetRunTimeStats(taskStats);
@@ -328,7 +336,7 @@ void updateTelnetTasksCpuLoad(char *taskStats) {
 }
 
 String sampleWebCpuLoadText() {
-#if defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
+#if !defined(NEXSTAR_DIAGNOSTIC_LIGHT) && defined(ESP32) && defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1) && defined(configUSE_STATS_FORMATTING_FUNCTIONS) && (configUSE_STATS_FORMATTING_FUNCTIONS == 1)
   static char taskStats[2048];
   memset(taskStats, 0, sizeof(taskStats));
   vTaskGetRunTimeStats(taskStats);

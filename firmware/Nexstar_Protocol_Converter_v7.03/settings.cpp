@@ -22,8 +22,6 @@ const char* WIFI_FILE = "/wifi.cfg";
 
 const uint8_t BRIDGE_MODE_WIFI_FULL = 0;
 const uint8_t BRIDGE_MODE_BT_MIN_WEB = 1;
-const uint8_t BRIDGE_MODE_WIFI_SERVERS = 2;
-const uint8_t BRIDGE_MODE_WEB_ONLY = 3;
 uint8_t bridgeMode = BRIDGE_MODE_WIFI_FULL;
 
 uint16_t ALPACA_PORT = 11111;
@@ -63,6 +61,7 @@ unsigned long idlePollIntervalMs = 8000;
 unsigned long mountHandshakeTimeoutMs = 3000;
 unsigned long minClientPollIntervalMs = 1000;
 unsigned long gotoQueueTimeoutMs = 10000UL;
+uint16_t btWaitSeconds = 60;
 unsigned long lastPersistentSaveMs = 0;
 uint32_t persistentSaveCount = 0;
 
@@ -71,7 +70,7 @@ extern unsigned long nextMountPollDueMs;
 extern unsigned long sanitizeGotoQueueTimeoutMs(unsigned long v);
 
 const uint32_t SETTINGS_MAGIC = 0x4E504333; // "NPC3"
-const uint16_t SETTINGS_VERSION = 6;
+const uint16_t SETTINGS_VERSION = 7;
 const char* SETTINGS_FILE = "/settings.bin";
 
 #if defined(ESP32)
@@ -91,6 +90,7 @@ bool saveSettingsNVS() {
   prefs.putUInt("idlePoll", idlePollIntervalMs);
   prefs.putUInt("hsTimeout", mountHandshakeTimeoutMs);
   prefs.putUInt("minPoll", minClientPollIntervalMs);
+  prefs.putUShort("btWait", btWaitSeconds);
   prefs.putBool("siteValid", siteValid);
 
   prefs.putDouble("nudge0", nudgeRateDeg[0]);
@@ -151,6 +151,8 @@ bool loadSettingsNVS() {
   idlePollIntervalMs = prefs.getUInt("idlePoll", idlePollIntervalMs);
   mountHandshakeTimeoutMs = prefs.getUInt("hsTimeout", mountHandshakeTimeoutMs);
   minClientPollIntervalMs = prefs.getUInt("minPoll", minClientPollIntervalMs);
+  btWaitSeconds = prefs.getUShort("btWait", btWaitSeconds);
+  if (btWaitSeconds < 10 || btWaitSeconds > 300) btWaitSeconds = 60;
   siteValid = prefs.getBool("siteValid", siteValid);
 
   nudgeRateDeg[0] = prefs.getDouble("nudge0", nudgeRateDeg[0]);
@@ -254,6 +256,7 @@ bool savePersistentSettings() {
   s.idlePollIntervalMs = idlePollIntervalMs;
   s.mountHandshakeTimeoutMs = mountHandshakeTimeoutMs;
   s.minClientPollIntervalMs = minClientPollIntervalMs;
+  s.btWaitSeconds = btWaitSeconds;
   s.siteValid = siteValid;
 
   for (int i = 0; i < 4; i++) s.nudgeRateDeg[i] = nudgeRateDeg[i];
@@ -383,6 +386,8 @@ bool loadPersistentSettings() {
   pollIntervalMs = s.pollIntervalMs;
   idlePollIntervalMs = s.idlePollIntervalMs;
   minClientPollIntervalMs = s.minClientPollIntervalMs;
+  btWaitSeconds = s.btWaitSeconds;
+  if (btWaitSeconds < 10 || btWaitSeconds > 300) btWaitSeconds = 60;
   if (s.mountHandshakeTimeoutMs >= 500UL && s.mountHandshakeTimeoutMs <= 10000UL) {
     mountHandshakeTimeoutMs = s.mountHandshakeTimeoutMs;
   }
@@ -623,37 +628,6 @@ bool saveBluetoothLiteApOnlySettings() {
 #endif
 }
 
-bool loadBridgeMode() {
-#if defined(ESP32)
-  Preferences prefs;
-  if (!prefs.begin("nexstar", true)) return false;
-  uint8_t m = prefs.getUChar("bridgeMode", BRIDGE_MODE_WIFI_FULL);
-  prefs.end();
-  if (m == BRIDGE_MODE_BT_MIN_WEB) bridgeMode = BRIDGE_MODE_BT_MIN_WEB;
-  else if (m == BRIDGE_MODE_WIFI_SERVERS) bridgeMode = BRIDGE_MODE_WIFI_SERVERS;
-  else if (m == BRIDGE_MODE_WEB_ONLY) bridgeMode = BRIDGE_MODE_WEB_ONLY;
-  else bridgeMode = BRIDGE_MODE_WIFI_FULL;
-  return true;
-#else
-  bridgeMode = BRIDGE_MODE_WIFI_FULL;
-  return true;
-#endif
-}
-
-bool saveBridgeMode(uint8_t mode) {
-  if (mode == BRIDGE_MODE_BT_MIN_WEB) bridgeMode = BRIDGE_MODE_BT_MIN_WEB;
-  else if (mode == BRIDGE_MODE_WIFI_SERVERS) bridgeMode = BRIDGE_MODE_WIFI_SERVERS;
-  else if (mode == BRIDGE_MODE_WEB_ONLY) bridgeMode = BRIDGE_MODE_WEB_ONLY;
-  else bridgeMode = BRIDGE_MODE_WIFI_FULL;
-#if defined(ESP32)
-  Preferences prefs;
-  if (!prefs.begin("nexstar", false)) return false;
-  prefs.putUChar("bridgeMode", bridgeMode);
-  prefs.end();
-#endif
-  return true;
-}
-
 bool loadFirmwareLoggingEnabled() {
 #if defined(ESP32)
   Preferences prefs;
@@ -676,66 +650,6 @@ bool saveFirmwareLoggingEnabled(bool enabled) {
   prefs.end();
 #endif
   return true;
-}
-
-bool saveBluetoothLiteWebBootEnabled(bool enabled) {
-  btLiteBootWebEnabled = enabled;
-  setBluetoothTinyWebRuntimeEnabled(enabled);
-#if defined(ESP32)
-  Preferences prefs;
-  if (!prefs.begin("nexstar", false)) {
-    LOG_SET_E("NVS save FAILED: btWebBoot prefs.begin write");
-    return false;
-  }
-  prefs.putBool("valid", true);
-  prefs.putBool("btWebBoot", btLiteBootWebEnabled);
-  prefs.end();
-  LOG_SET_I("BT boot web server saved: %s", btLiteBootWebEnabled ? "enabled" : "disabled");
-#endif
-  return true;
-}
-
-bool saveBluetoothLitePollInterval(unsigned long ms) {
-#if defined(ESP32)
-  Preferences prefs;
-  if (!prefs.begin("nexstar", false)) {
-    LOG_SET_E("NVS save FAILED: btPollMs prefs.begin write");
-    return false;
-  }
-  prefs.putUInt("btPollMs", ms);
-  prefs.end();
-  LOG_SET_I("BT mount poll interval saved separately: %lu ms", ms);
-  return true;
-#else
-  // ESP8266/non-NVS fallback: runtime only, do not alter the Full WiFi poll setting file.
-  return true;
-#endif
-}
-
-bool loadBluetoothLitePollInterval() {
-#if defined(ESP32)
-  Preferences prefs;
-  if (!prefs.begin("nexstar", true)) {
-    LOG_SET_W("NVS load skipped: btPollMs prefs.begin read failed");
-    return false;
-  }
-  bool exists = prefs.isKey("btPollMs");
-  unsigned long v = prefs.getUInt("btPollMs", pollIntervalMs);
-  prefs.end();
-
-  if (!exists) {
-    LOG_SET_I("No separate BT mount poll interval saved; using current default %lu ms", pollIntervalMs);
-    return false;
-  }
-
-  if (v > 60000) v = 60000;
-  pollIntervalMs = v;
-  resetMountPollScheduler();
-  LOG_SET_I("BT mount poll interval loaded separately: %lu ms", pollIntervalMs);
-  return true;
-#else
-  return false;
-#endif
 }
 
 bool saveGotoQueueTimeoutMs(unsigned long v) {
